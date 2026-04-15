@@ -45,6 +45,13 @@ SYCL_TLA_RUNTIME_PATHS=(-Wl,-rpath,/lib64/stubs -Wl,-rpath,"$MKLROOT/lib" -Wl,-r
 BMG_09_LINK_FLAGS=(-Xs "-options \"-igc_opts 'VectorAliasBBThreshold=10000'\"")
 BMG_10_LINK_FLAGS=(-Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
 
+VLLM_XPU_AOT_DEVICES=${VLLM_XPU_AOT_DEVICES:-pvc,bmg,bmg-g21-a0,bmg-g31-a0}
+VLLM_MOE_COMPILE_FLAGS=(-fsycl -fsycl-targets=spir64_gen -fno-sycl-instrument-device-code -O3 -DNDEBUG -std=c++17)
+VLLM_MOE_LINK_FLAGS=(-fsycl -fsycl-targets=spir64_gen -fsycl-max-parallel-link-jobs=16 -flink-huge-device-code -Xspirv-translator "-spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate")
+if [ -n "$VLLM_XPU_AOT_DEVICES" ]; then
+    VLLM_MOE_LINK_FLAGS+=(-Xsycl-target-backend=spir64_gen "-device $VLLM_XPU_AOT_DEVICES")
+fi
+
 echo "Building store_kv_cache SYCL extension..."
 icpx -fsycl -shared -fPIC -O2 -std=c++17 \
     -DTORCH_EXTENSION_NAME=store_kv_cache_sycl \
@@ -156,6 +163,37 @@ icpx -fsycl -fsycl-targets=spir64_gen -Xs "-device bmg-g21" \
 
 echo "Built: $SCRIPT_DIR/scale_dynamic_quant_sycl.so"
 ls -la scale_dynamic_quant_sycl.so
+
+echo ""
+echo "Building moe_swiglu_dynamic_quant SYCL extension..."
+icpx "${VLLM_MOE_COMPILE_FLAGS[@]}" -shared -fPIC \
+    -DTORCH_EXTENSION_NAME=moe_swiglu_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    moe_swiglu_dynamic_quant_kernel.cpp \
+    -o moe_swiglu_dynamic_quant_sycl.so \
+    "${VLLM_MOE_LINK_FLAGS[@]}" \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+echo "Built: $SCRIPT_DIR/moe_swiglu_dynamic_quant_sycl.so"
+ls -la moe_swiglu_dynamic_quant_sycl.so
+
+echo ""
+echo "Building moe_scatter_dynamic_quant SYCL extension..."
+icpx "${VLLM_MOE_COMPILE_FLAGS[@]}" -shared -fPIC \
+    -DTORCH_EXTENSION_NAME=moe_scatter_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    moe_scatter_dynamic_quant_kernel.cpp \
+    -o moe_scatter_dynamic_quant_sycl.so \
+    "${VLLM_MOE_LINK_FLAGS[@]}" \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+
+echo "Built: $SCRIPT_DIR/moe_scatter_dynamic_quant_sycl.so"
+ls -la moe_scatter_dynamic_quant_sycl.so
 
 echo "Building bmg_moe_gating_gemm_sycl SYCL extension..."
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \

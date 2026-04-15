@@ -2355,15 +2355,11 @@ class MoeScatterDynamicQuantOp(BasicOp):
 
         # src_dtype
         self.dtype = self.args_dict["dtype"]
-        if not self.dtype in ["bfloat16"]:
-            raise ValueError
-        self.torch_dtype = getattr(torch, self.dtype)
+        self.torch_dtype = get_torch_dtype(self.dtype)
 
         # dst_dtype
         self.dst_dtype = self.args_dict["dst_dtype"]
-        if not self.dst_dtype in ["int8", "float8"]:
-            raise ValueError
-        self.dst_torch_dtype = getattr(torch, self.dst_dtype)
+        self.dst_torch_dtype = get_torch_dtype(self.dst_dtype)
 
         # predefined attrs
         self.num_tokens = self.args_dict["num_tokens"]
@@ -2397,6 +2393,16 @@ class MoeScatterDynamicQuantOp(BasicOp):
             ep_size=self.ep_size, ep_rank=self.ep_rank
         )
 
+        self.vendor_local_selected_experts = [
+            [
+                expert_idx - self.experts_start_idx
+                if self.experts_start_idx <= expert_idx < self.experts_end_idx
+                else -1
+                for expert_idx in token_experts
+            ]
+            for token_experts in self.all_select_experts
+        ]
+
 
         # input/output tensors
         self.input_tensor_info = {
@@ -2411,11 +2417,25 @@ class MoeScatterDynamicQuantOp(BasicOp):
                 device=self.backend.get_torch_device_name(),
                 creator=torch.ones
             ), 
+            # Alias specifically for vendor kernels ensuring the same shape memory is allocated
+            "smooth_scale": OpTensorInfo(
+                shape=[self.num_experts, self.hidden_size], 
+                dtype=torch.float32, 
+                device=self.backend.get_torch_device_name(),
+                creator=torch.ones
+            ), 
             "selected_experts": OpTensorInfo(
                 shape=[self.num_tokens, self.topk], 
                 dtype=torch.int32, 
                 device=self.backend.get_torch_device_name(),
                 creator=lambda size, dtype, device: torch.tensor(self.all_select_experts, dtype=dtype, device=device)
+            ), 
+            "selected_experts_local": OpTensorInfo(
+                shape=[self.num_tokens, self.topk], 
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(),
+                creator=lambda size, dtype, device: torch.tensor(
+                    self.vendor_local_selected_experts, dtype=dtype, device=device)
             ), 
             # complete moe_weights
             "moe_weights": OpTensorInfo(
@@ -2424,6 +2444,19 @@ class MoeScatterDynamicQuantOp(BasicOp):
                 device=self.backend.get_torch_device_name(),
                 creator=lambda size, dtype, device: torch.tensor(self.all_select_weights, dtype=dtype, device=device)
             ), 
+            "smooth_scale_local": OpTensorInfo(
+                shape=[self.num_experts_per_rank, self.hidden_size], 
+                dtype=torch.float32, 
+                device=self.backend.get_torch_device_name(),
+                creator=torch.ones
+            ), 
+            # Workspace tensor explicitly for vendor fused kernels
+            "token_to_scatter_offset": OpTensorInfo(
+                shape=[self.num_tokens, self.topk], 
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(),
+                creator=torch.zeros
+            ),
         }
         self.output_tensor_info = {
             "scatter_tokens": OpTensorInfo(
@@ -2452,6 +2485,13 @@ class MoeScatterDynamicQuantOp(BasicOp):
                 creator=lambda size, dtype, device: torch.tensor(
                     self.scatter_token_weight, dtype=dtype, device=device)
             ), 
+            # Additional workspace outputs for vendor integration
+            "scatter_tokens_offset": OpTensorInfo(
+                shape=[self.dispatch_tokens], 
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(),
+                creator=lambda size, dtype, device: torch.ones(size, dtype=dtype, device=device) * -1
+            ), 
             "experts_token_count": OpTensorInfo(
                 shape=[self.num_experts_per_rank], 
                 dtype=torch.int32, 
@@ -2465,6 +2505,14 @@ class MoeScatterDynamicQuantOp(BasicOp):
                 device=self.backend.get_torch_device_name(),
                 creator=lambda size, dtype, device: torch.tensor(
                     self.expert_dispatch_token_offset, dtype=dtype, device=device)
+            ),
+            # Alias for vendor start pointers (matches exact shape of token count vs offset)
+            "experts_token_start": OpTensorInfo(
+                shape=[self.num_experts_per_rank], 
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(),
+                creator=lambda size, dtype, device: torch.tensor(
+                    self.expert_dispatch_token_offset[:self.num_experts_per_rank], dtype=dtype, device=device)
             )
         }
 
@@ -3052,7 +3100,17 @@ class MoeSwigluDynamicQuantOp(BasicOp):
             self.num_tokens, self.num_experts, self.topk, 
             ep_size=self.ep_size, ep_rank=self.ep_rank
         )        
+        self.scatter_expert_ids = [
+            expert_idx
+            for expert_idx, token_count in enumerate(self.expert_dispatch_token_count)
+            for _ in range(token_count)
+        ]
 
+        self.scatter_expert_ids = [
+            expert_idx
+            for expert_idx, token_count in enumerate(self.expert_dispatch_token_count)
+            for _ in range(token_count)
+        ]
 
         # 以下参数决定 moe_swiglu_dynamic_quant 的具体数据类型
         self.dtype = self.args_dict.get("dtype", "bfloat16")
@@ -3063,7 +3121,7 @@ class MoeSwigluDynamicQuantOp(BasicOp):
 
 
     def vendor_parser(self):
-        if self.dtype == "bfloat16" and self.dst_dtype == "int8":
+        if self.dtype in ["bfloat16", "float16"] and self.dst_dtype in ["int8", "float8", "float8_e4m3", "float8_e4m3fn"]:
             pass
         else:
             raise ValueError(
@@ -3087,6 +3145,13 @@ class MoeSwigluDynamicQuantOp(BasicOp):
                 device=self.backend.get_torch_device_name(),
                 creator=torch.ones
             ), 
+            # Alias explicitly for vendor kernels
+            "smooth_scale": OpTensorInfo(
+                shape=[self.num_experts_per_rank, self.hidden_size], 
+                dtype=torch.float32, 
+                device=self.backend.get_torch_device_name(),
+                creator=torch.ones
+            ), 
             "experts_token_count": OpTensorInfo(
                 shape=[self.num_experts_per_rank], 
                 dtype=torch.int32, 
@@ -3099,13 +3164,28 @@ class MoeSwigluDynamicQuantOp(BasicOp):
                 dtype=torch.int32, 
                 device=self.backend.get_torch_device_name(),
                 creator=lambda size, dtype, device: torch.tensor(
-                    self.expert_dispatch_token_offset, dtype=dtype, device=device)
+                    self.expert_dispatch_token_offset[:self.num_experts_per_rank], dtype=dtype, device=device)
+            ),
+            # Alias for vendor start pointers
+            "experts_token_start": OpTensorInfo(
+                shape=[self.num_experts_per_rank], 
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(),
+                creator=lambda size, dtype, device: torch.tensor(
+                    self.expert_dispatch_token_offset[:self.num_experts_per_rank], dtype=dtype, device=device)
+            ),
+            "scatter_expert_ids": OpTensorInfo(
+                shape=[self.dispatch_tokens], 
+                dtype=torch.int32, 
+                device=self.backend.get_torch_device_name(),
+                creator=lambda size, dtype, device: torch.tensor(
+                    self.scatter_expert_ids, dtype=dtype, device=device)
             )
         }
         self.output_tensor_info = {
             "quant_tokens": OpTensorInfo(
                 shape=[self.dispatch_tokens, self.hidden_size], 
-                dtype=self.torch_dtype, 
+                dtype=self.dst_torch_dtype,
                 device=self.backend.get_torch_device_name(),
             ), 
             "per_token_scale": OpTensorInfo(

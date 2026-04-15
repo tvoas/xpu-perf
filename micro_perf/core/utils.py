@@ -40,6 +40,7 @@ TORCH_DTYPE_MAPPING = {
 
     "float8": torch.float8_e4m3fn,
     "float8_e4m3": torch.float8_e4m3fn,
+    "float8_e4m3fn": torch.float8_e4m3fn,
     "float8_e5m2": torch.float8_e5m2,
 
     "int32": torch.int32,
@@ -53,6 +54,8 @@ TORCH_DTYPE_MAPPING = {
 
 
 def get_torch_dtype(dtype: str) -> torch.dtype:
+    if dtype not in TORCH_DTYPE_MAPPING:
+        raise ValueError(f"Unsupported dtype: {dtype}")
     return TORCH_DTYPE_MAPPING[dtype]
 
 def get_torch_dtype_size(dtype: torch.dtype) -> int:
