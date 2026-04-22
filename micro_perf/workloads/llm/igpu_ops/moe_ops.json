@@ -29,8 +29,8 @@
     "moe_scatter_dynamic_quant": [
         {
             "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
+            "dtype": ["bfloat16", "float16"],
+            "dst_dtype": ["int8", "float8_e4m3fn"],
             "world_size.rank": [
                 [1, 0]
             ],
@@ -61,8 +61,8 @@
     "moe_swiglu_dynamic_quant": [
         {
             "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
+            "dtype": ["bfloat16", "float16"],
+            "dst_dtype": ["int8", "float8_e4m3fn"],
             "world_size.rank": [
                 [1, 0]
             ],
