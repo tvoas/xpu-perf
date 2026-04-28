@@ -316,10 +316,11 @@ def load_plugin_package(package_path: str):
         return None
     provider_name = f"xpu_perf_provider_{provider_name}"
 
-    spec = importlib.util.spec_from_file_location(provider_name, init_file)
+    spec = importlib.util.spec_from_file_location(provider_name, init_file,
+        submodule_search_locations=[str(pathlib.Path(package_path))])
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
     sys.modules[provider_name] = module
+    spec.loader.exec_module(module)
     parse_vendor_ops(provider_name, init_file)
 
 

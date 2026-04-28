@@ -23,12 +23,12 @@ class ScaleDynamicQuantOp(BasicOp):
         self.dst_dtype = self.args_dict.get("dst_dtype", "int8")
 
     def vendor_parser(self):
-        if self.dtype == "bfloat16" \
+        if self.dtype in ("bfloat16", "float16") \
             and self.dst_dtype == "int8":
             pass
         else:
             raise ValueError(
-                f"{type(self).__name__} only support bfloat16 -> int8, "
+                f"{type(self).__name__} only support bfloat16/float16 -> int8, "
                 f"but got dtype={self.dtype}, dst_dtype={self.dst_dtype}"
             )
 

@@ -1,0 +1,158 @@
+import pathlib
+from functools import partial
+import importlib.util
+
+from xpu_perf.micro_perf.core.op import ProviderRegistry, BasicOp
+from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size
+RotaryEmbeddingOp = ProviderRegistry.BASE_IMPL_MAPPING["rotary_embedding"]
+
+_utils_path = pathlib.Path(__file__).resolve().parent.parent / "utils.py"
+_spec = importlib.util.spec_from_file_location("intel_ops_utils", _utils_path)
+_utils = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_utils)
+generate_decode_data = _utils.generate_decode_data
+generate_prefill_data = _utils.generate_prefill_data
+generate_prefill_session_cache_data = _utils.generate_prefill_session_cache_data
+
+try:
+    import torch
+    torch.ops.torch_ipex.dynamic_rotary_embedding
+
+    @ProviderRegistry.register_vendor_impl("rotary_embedding", "ipex")
+    class RotaryEmbeddingIpexOp(BasicOp):
+        def __init__(self, args_dict, backend, *args, **kwargs):
+            super().__init__(args_dict, backend, *args, **kwargs)
+
+        def prepare(self):
+            self.arg_type = self.args_dict["arg_type"]
+            if not self.arg_type in ["llm"]:
+                raise NotImplementedError
+
+            self.dtype = self.args_dict.get("dtype", "bfloat16")
+            if not self.dtype in ["float16", "bfloat16"]:
+                raise NotImplementedError
+            self.torch_dtype = getattr(torch, self.dtype)
+
+            self.q_head_num = self.args_dict["q_head_num"]
+            self.kv_head_num = self.args_dict["kv_head_num"]
+            self.head_dim = self.args_dict["head_dim"]
+            self.total_head_num = self.q_head_num + 2 * self.kv_head_num
+
+            self.rope_offset = self.args_dict.get("rope_offset", 0)
+            self.rope_dim = self.args_dict["rope_dim"]
+
+            self.mode = self.args_dict.get("attn_mode", self.args_dict.get("mode", "prefill"))
+            if self.mode == "prefill":
+                self.batch_size = 1
+                self.q_seq_len = self.args_dict.get("q_len", self.args_dict.get("q_seq_len"))
+                self.cache_len = self.args_dict["cache_len"]
+                self.q_lens, self.accum_q_lens, self.cache_lens, self.cache_slot_ids, self.kv_lens = \
+                    generate_prefill_data(self.q_seq_len, self.cache_len)
+            elif self.mode == "prefill_session_cache":
+                self.batch_size = self.args_dict.get("batch_size", 1)
+                self.q_seq_len = self.args_dict.get("q_len", self.args_dict.get("q_seq_len"))
+                self.cache_len = self.args_dict["cache_len"]
+                self.q_lens, self.accum_q_lens, self.cache_lens, self.cache_slot_ids, self.kv_lens = \
+                    generate_prefill_session_cache_data(self.batch_size, self.q_seq_len, self.cache_len)
+            elif self.mode == "decode":
+                self.batch_size = self.args_dict.get("batch_size", 1)
+                self.q_seq_len = self.args_dict.get("q_len", self.args_dict.get("q_seq_len"))
+                self.cache_len = self.args_dict["cache_len"]
+                self.q_lens, self.accum_q_lens, self.cache_lens, self.cache_slot_ids, self.kv_lens = \
+                    generate_decode_data(self.batch_size, self.q_seq_len, self.cache_len)
+            else:
+                raise NotImplementedError
+
+            self.num_tokens = sum(self.q_lens)
+            self.num_cache_tokens = sum(self.cache_lens)
+            self.max_kv_len = max(self.kv_lens)
+            self.max_q_len = max(self.q_lens)
+
+            def precompute_freqs_cis(dim, max_seq_len, theta: float = 10000.0):
+                freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+                t = torch.arange(max_seq_len, device=freqs.device)
+                freqs = torch.outer(t, freqs).float()
+                freqs_cis = torch.polar(torch.ones_like(freqs), freqs)
+                return torch.real(freqs_cis), torch.imag(freqs_cis)
+
+            cos_tensor, sin_tensor = precompute_freqs_cis(self.rope_dim, self.max_kv_len)
+
+            self.input_tensor_info = {
+                "packed_qkv": OpTensorInfo(
+                    shape=[self.num_tokens, self.total_head_num, self.head_dim],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name()
+                ),
+                "q_lens": OpTensorInfo(
+                    shape=[self.batch_size], dtype=torch.int64,
+                    device=self.backend.get_torch_device_name(),
+                    creator=lambda size, dtype, device: torch.tensor(self.q_lens, dtype=dtype, device=device)
+                ),
+                "accum_q_lens": OpTensorInfo(
+                    shape=[self.batch_size + 1], dtype=torch.int64,
+                    device=self.backend.get_torch_device_name(),
+                    creator=lambda size, dtype, device: torch.tensor(self.accum_q_lens, dtype=dtype, device=device)
+                ),
+                "cache_lens": OpTensorInfo(
+                    shape=[self.batch_size], dtype=torch.int64,
+                    device=self.backend.get_torch_device_name(),
+                    creator=lambda size, dtype, device: torch.tensor(self.cache_lens, dtype=dtype, device=device)
+                ),
+                "cos": OpTensorInfo(
+                    shape=[self.max_kv_len, self.rope_dim],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name(),
+                    creator=lambda size, dtype, device: cos_tensor.to(device=device)
+                ),
+                "sin": OpTensorInfo(
+                    shape=[self.max_kv_len, self.rope_dim],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name(),
+                    creator=lambda size, dtype, device: sin_tensor.to(device=device)
+                ),
+            }
+            self.output_tensor_info = {
+                "y": OpTensorInfo(
+                    shape=[self.num_tokens, self.total_head_num, self.head_dim],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name()
+                )
+            }
+
+            self.input_tensor_size = sum([calc_tensor_size(info) for info in self.input_tensor_info.values()])
+            self.output_tensor_size = sum([calc_tensor_size(info) for info in self.output_tensor_info.values()])
+            self.tensor_size = self.input_tensor_size + self.output_tensor_size
+
+            self.read_bytes = \
+                calc_tensor_size(self.input_tensor_info["packed_qkv"]) / self.total_head_num * (self.q_head_num + self.kv_head_num) + \
+                calc_tensor_size(self.input_tensor_info["q_lens"]) + \
+                calc_tensor_size(self.input_tensor_info["accum_q_lens"]) + \
+                calc_tensor_size(self.input_tensor_info["cache_lens"]) + \
+                calc_tensor_size(self.input_tensor_info["cos"]) + \
+                calc_tensor_size(self.input_tensor_info["sin"])
+            self.write_bytes = \
+                calc_tensor_size(self.output_tensor_info["y"]) / self.total_head_num * (self.q_head_num + self.kv_head_num)
+            self.io_bytes = self.read_bytes + self.write_bytes
+
+            self._create_tensors_func = partial(
+                self._create_in_out_tensors, create_inputs=True, create_outputs=True
+            )
+            self._run_func = self.rotary_embedding_run
+
+        def rotary_embedding_run(self, tensor_mapping):
+            packed_qkv = tensor_mapping["packed_qkv"]
+            q_lens = tensor_mapping["q_lens"]
+            accum_q_lens = tensor_mapping["accum_q_lens"]
+            cache_lens = tensor_mapping["cache_lens"]
+            cos = tensor_mapping["cos"]
+            sin = tensor_mapping["sin"]
+            y = tensor_mapping["y"]
+
+            torch.ops.torch_ipex.dynamic_rotary_embedding(packed_qkv, q_lens, accum_q_lens, cache_lens, cos, sin, y,
+                                                          self.q_head_num, self.kv_head_num, self.rope_offset, self.rope_dim, self.max_q_len)
+            return y
+
+except Exception:
+    pass
+
+OP_MAPPING = {"torch": RotaryEmbeddingOp}

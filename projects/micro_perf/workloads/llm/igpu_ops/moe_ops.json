@@ -1,0 +1,79 @@
+{
+    "moe_gating_gemm": [
+        {
+            "arg_type": "llm",
+            "dtype.dst_dtype": [
+                ["bfloat16", "float32"]
+            ],
+            "num_experts": [256],
+            "hidden_size": [7168],
+            "num_tokens": [40, 80, 1024, 4096]
+        }
+    ],
+    "moe_softmax_topk": [
+        {
+            "arg_type": "llm",
+            "dtype": "float32",
+            "num_experts.topk": [
+                [256, 8]
+            ],
+            "compute_mode": [
+                "pre-softmax",
+                "post-softmax"
+            ],
+            "hidden_size": [7168],
+            "sp_size": [1],
+            "num_tokens": [40, 80, 4096]
+        }
+    ],
+    "moe_scatter_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "dst_dtype": "int8",
+            "world_size.rank": [
+                [1, 0]
+            ],
+            "num_shared_experts.dp_size.sp_size": [
+                [0, 1, 1]
+            ],
+            "num_experts.ep_size": [
+                [256, 1]
+            ],
+            "hidden_size": [7168],
+            "num_tokens": [40, 80, 4096],
+            "topk": [5, 8]
+        }
+    ],
+    "moe_quant_matmul": [
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "dst_dtype": "float16",
+            "hidden_size.new_hidden_size": [
+                [7168, 4096],
+                [7168, 2048],
+                [2048, 7168]
+            ],
+            "num_tokens": [40, 80, 4096]
+        }
+    ],
+    "moe_swiglu_dynamic_quant": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "dst_dtype": "int8",
+            "world_size.rank": [
+                [1, 0]
+            ],
+            "num_shared_experts.dp_size.sp_size": [
+                [0, 1, 1]
+            ],
+            "num_experts.topk.ep_size": [
+                [256, 8, 1]
+            ],
+            "hidden_size": [2048],
+            "num_tokens": [40, 80, 4096]
+        }
+    ]
+}

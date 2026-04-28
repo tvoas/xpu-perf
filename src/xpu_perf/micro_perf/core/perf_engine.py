@@ -202,7 +202,10 @@ class XpuPerfServer:
         for engine_name, engine_instance in self.started_engines.items():
             engine_instance.stop()
         if self.backend_instance:
-            self.backend_instance.clean_extra_files()
+            try:
+                self.backend_instance.clean_extra_files()
+            except Exception:
+                pass
 
 
     def get_info(self):

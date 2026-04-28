@@ -125,6 +125,9 @@ class MoeQuantGroupGemmOp(BasicOp):
         )
 
         # calculator
+        # Only count weights/scales for experts that actually have tokens dispatched
+        self.active_experts = sum(1 for c in self.expert_dispatch_token_count if c > 0)
+
         self.input_tensor_size = sum([
             calc_tensor_size(info) for info in self.input_tensor_info.values()
         ])
@@ -133,7 +136,15 @@ class MoeQuantGroupGemmOp(BasicOp):
         ])
         self.tensor_size = self.input_tensor_size + self.output_tensor_size
 
-        self.read_bytes = self.input_tensor_size
+        # For io_bytes estimation, only count weight/scale rows for active experts
+        w_dtype_size = self.input_tensor_info["experts_weight"].dtype.itemsize
+        s_dtype_size = self.input_tensor_info["experts_scale"].dtype.itemsize
+        active_weight_bytes = self.active_experts * self.new_hidden_size * self.hidden_size * w_dtype_size
+        active_scale_bytes = self.active_experts * self.new_hidden_size * s_dtype_size
+        full_weight_bytes = self.num_experts_per_rank * self.new_hidden_size * self.hidden_size * w_dtype_size
+        full_scale_bytes = self.num_experts_per_rank * self.new_hidden_size * s_dtype_size
+
+        self.read_bytes = self.input_tensor_size - full_weight_bytes - full_scale_bytes + active_weight_bytes + active_scale_bytes
         self.write_bytes = self.output_tensor_size
         self.io_bytes = self.read_bytes + self.write_bytes
 
