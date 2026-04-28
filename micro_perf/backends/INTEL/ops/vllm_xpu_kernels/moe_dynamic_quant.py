@@ -41,8 +41,7 @@ try:
             experts_token_count.zero_()
             experts_token_start.zero_()
 
-            # Retrieve num_shared_experts (parent class or args fallback)
-            num_shared_experts = getattr(self, "num_shared_experts", self.args_dict.get("num_shared_experts", 0))
+            num_shared_experts = self.args_dict.get("num_shared_experts", 0)
 
             torch.ops._moe_C.moe_scatter_dynamic_quant(
                 selected_experts,
@@ -85,9 +84,9 @@ try:
             quant_tokens = tensor_mapping["quant_tokens"]
             per_token_scale = tensor_mapping["per_token_scale"]
 
-            # Retrieve metadata lengths built by the parent `prepare`
-            total_experts_num = getattr(self, "total_experts_num", experts_token_count.size(0))
-            max_token_num = getattr(self, "max_token_num", int(experts_token_count.max().item()))
+            # C++ backend takes total experts instead of experts per rank
+            total_experts_num = experts_token_count.size(0)
+            max_token_num = int(experts_token_count.max().item())
 
             torch.ops._moe_C.moe_swiglu_dynamic_quant(
                 scatter_tokens,
@@ -104,4 +103,3 @@ try:
 
 except ImportError:
     pass
-
