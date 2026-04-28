@@ -120,35 +120,8 @@ class BackendINTEL(Backend):
                 )
             return "ccl"
     
+
     def core_perf(
-        self, op_instance, 
-        warmup_iterations, prefer_iterations, 
-        tensor_list, 
-        profiling=True
-    ):
-        num_runs = 4
-        sleep_time = 0.2
-        total_latency = 0.0
-        all_kernels = set()
-
-        for i in range(num_runs):
-            latency, kernels = self._core_perf(
-                op_instance, 
-                warmup_iterations, 
-                prefer_iterations, 
-                tensor_list, 
-                profiling
-            )
-            total_latency += latency
-            all_kernels.update(kernels)
-
-            if i < num_runs - 1:
-                time.sleep(sleep_time)
-
-        avg_latency = total_latency / num_runs
-        return avg_latency, list(all_kernels)
-
-    def _core_perf(
         self, op_instance, 
         warmup_iterations, prefer_iterations, 
         tensor_list, 
