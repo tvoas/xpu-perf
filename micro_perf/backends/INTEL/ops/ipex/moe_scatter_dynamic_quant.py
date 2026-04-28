@@ -16,14 +16,7 @@ try:
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["ipex"]
-
-            self._create_tensors_func = partial(
-                self._create_in_out_tensors, 
-                create_inputs=True, 
-                create_outputs=True
-            )
             self._run_func = self.moe_scatter_dynamic_quant_run
-
 
         def moe_scatter_dynamic_quant_run(self, tensor_mapping):
             # get pre-allocated input tensors

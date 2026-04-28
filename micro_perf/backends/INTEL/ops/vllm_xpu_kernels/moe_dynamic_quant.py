@@ -16,12 +16,6 @@ try:
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["vllm_xpu_kernels"]
-
-            self._create_tensors_func = partial(
-                self._create_in_out_tensors, 
-                create_inputs=True, 
-                create_outputs=True
-            )
             self._run_func = self.moe_scatter_dynamic_quant_run
 
         def moe_scatter_dynamic_quant_run(self, tensor_mapping):
@@ -37,6 +31,7 @@ try:
             experts_token_count = tensor_mapping["experts_token_count"]
             experts_token_start = tensor_mapping["experts_token_start"]
 
+            # Zero out workspace buffers for tracking states
             token_to_scatter_offset.zero_()
             experts_token_count.zero_()
             experts_token_start.zero_()
@@ -67,12 +62,6 @@ try:
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["vllm_xpu_kernels"]
-
-            self._create_tensors_func = partial(
-                self._create_in_out_tensors, 
-                create_inputs=True, 
-                create_outputs=True
-            )
             self._run_func = self.moe_swiglu_dynamic_quant_run
 
         def moe_swiglu_dynamic_quant_run(self, tensor_mapping):
