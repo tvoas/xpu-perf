@@ -207,5 +207,3 @@ try:
 
 except Exception:
     pass
-
-OP_MAPPING = {"torch": StoreKVCacheOp}

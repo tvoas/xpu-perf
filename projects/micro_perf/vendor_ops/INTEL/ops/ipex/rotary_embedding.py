@@ -154,5 +154,3 @@ try:
 
 except Exception:
     pass
-
-OP_MAPPING = {"torch": RotaryEmbeddingOp}

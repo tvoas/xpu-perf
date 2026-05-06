@@ -2,9 +2,8 @@ import pathlib
 from xpu_perf.micro_perf.core.op import ProviderRegistry
 MoeGatingGemmOp = ProviderRegistry.BASE_IMPL_MAPPING["moe_gating_gemm"]
 
-OP_MAPPING = {}
 
-
+@ProviderRegistry.register_vendor_impl("moe_gating_gemm", "torch")
 class MoeGatingGemmTorchOp(MoeGatingGemmOp):
     """Override vendor_parser to accept bfloat16/float16 input with float32 output."""
 
@@ -18,6 +17,3 @@ class MoeGatingGemmTorchOp(MoeGatingGemmOp):
                 f"MoeGatingGemmTorchOp supports float16/bfloat16/float32-->float32/float16, "
                 f"but got {self.dtype}-->{self.dst_dtype}"
             )
-
-
-OP_MAPPING["torch"] = MoeGatingGemmTorchOp

@@ -9,12 +9,22 @@ from xpu_perf.micro_perf.core.op import ProviderRegistry
 import os
 import pathlib
 import importlib.util
+import sys
 
-_torch_dequant_path = pathlib.Path(__file__).resolve().parent.parent / "torch" / "dequant_kv_cache.py"
-_spec_dq = importlib.util.spec_from_file_location("torch_dequant_kv_cache", _torch_dequant_path)
-_mod_dq = importlib.util.module_from_spec(_spec_dq)
-_spec_dq.loader.exec_module(_mod_dq)
-DequantKVCacheOp = _mod_dq.DequantKVCacheOp
+# Get the torch vendor impl of dequant_kv_cache (already registered by the torch provider).
+# If the torch provider's module is already in sys.modules, reuse it to avoid
+# re-executing the file (which would overwrite the "torch" registration with a
+# non-picklable module name).
+_torch_mod_name = "xpu_perf_provider_torch.dequant_kv_cache"
+if _torch_mod_name in sys.modules:
+    DequantKVCacheOp = sys.modules[_torch_mod_name].DequantKVCacheOp
+else:
+    _torch_dequant_path = pathlib.Path(__file__).resolve().parent.parent / "torch" / "dequant_kv_cache.py"
+    _spec_dq = importlib.util.spec_from_file_location(_torch_mod_name, _torch_dequant_path)
+    _mod_dq = importlib.util.module_from_spec(_spec_dq)
+    sys.modules[_torch_mod_name] = _mod_dq
+    _spec_dq.loader.exec_module(_mod_dq)
+    DequantKVCacheOp = _mod_dq.DequantKVCacheOp
 
 import torch
 from functools import partial

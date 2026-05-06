@@ -1,12 +1,11 @@
 import pathlib
 from functools import partial
 import torch
-from xpu_perf.micro_perf.core.op import BasicOp
+from xpu_perf.micro_perf.core.op import ProviderRegistry, BasicOp
 from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size
 
-OP_MAPPING = {}
 
-
+@ProviderRegistry.register_vendor_impl("add_rms_norm_dynamic_quant", "torch")
 class AddRmsNormDynamicQuantOp(BasicOp):
     def __init__(self, args_dict, backend, *args, **kwargs):
         super().__init__(args_dict, backend, *args, **kwargs)
@@ -144,6 +143,3 @@ class AddRmsNormDynamicQuantOp(BasicOp):
         quant_tokens.copy_((scaled / scale.unsqueeze(-1)).round().clamp(-128, 127).to(self.dst_torch_dtype))
 
         return quant_tokens, per_token_scale, after_res, after_norm
-
-
-OP_MAPPING["torch"] = AddRmsNormDynamicQuantOp

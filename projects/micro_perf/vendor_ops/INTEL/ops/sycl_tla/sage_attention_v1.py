@@ -58,7 +58,7 @@ def _load_ark():
 
 
 try:
-    @ProviderRegistry.register_vendor_impl("sage_attention_v1", "sycl-tla")
+    @ProviderRegistry.register_vendor_impl("sage_attention_v1", "sycl_tla")
     class SyclTlaSageAttentionV1Op(FlashAttentionOp):
         SUPPORTED_HDIMS = [64, 96, 128, 192]
 

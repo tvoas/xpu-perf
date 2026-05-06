@@ -3,7 +3,7 @@ from functools import partial
 import torch
 import random
 import importlib.util
-from xpu_perf.micro_perf.core.op import BasicOp
+from xpu_perf.micro_perf.core.op import ProviderRegistry, BasicOp
 from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size
 
 _utils_path = pathlib.Path(__file__).resolve().parent.parent / "utils.py"
@@ -14,9 +14,8 @@ generate_prefill_data = _utils.generate_prefill_data
 generate_prefill_session_cache_data = _utils.generate_prefill_session_cache_data
 generate_decode_data = _utils.generate_decode_data
 
-OP_MAPPING = {}
 
-
+@ProviderRegistry.register_vendor_impl("store_paged_kv_cache", "torch")
 class StorePagedKVCacheOp(BasicOp):
     def __init__(self, args_dict, backend, *args, **kwargs):
         super().__init__(args_dict, backend, *args, **kwargs)
@@ -221,6 +220,3 @@ class StorePagedKVCacheOp(BasicOp):
                 v_cache[physical_block, block_offset] = (v_tok.float() / v_tok.float().abs().amax(dim=-1, keepdim=True).clamp(min=1e-10) * 127.0).round().clamp(-128, 127).to(v_cache.dtype)
 
         return k_cache, v_cache
-
-
-OP_MAPPING["torch"] = StorePagedKVCacheOp

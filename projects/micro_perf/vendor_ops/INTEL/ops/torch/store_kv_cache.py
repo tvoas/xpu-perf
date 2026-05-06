@@ -149,6 +149,3 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
                     v_cache[physical_block, :, block_offset, :] = src_v
 
         return k_cache, v_cache
-
-
-OP_MAPPING = {"torch": StoreKVCacheOp}

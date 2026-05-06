@@ -1,6 +1,7 @@
 import torch
 from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size, get_torch_dtype, get_attn_info
-from xpu_perf.micro_perf.core.op import BasicOp
+from xpu_perf.micro_perf.core.op import ProviderRegistry
+BaseDequantKVCacheOp = ProviderRegistry.BASE_IMPL_MAPPING["dequant_kv_cache"]
 import pathlib
 from functools import partial
 
@@ -62,7 +63,8 @@ if HAS_TRITON:
         )
 
 
-class DequantKVCacheOp(BasicOp):
+@ProviderRegistry.register_vendor_impl("dequant_kv_cache", "torch")
+class DequantKVCacheOp(BaseDequantKVCacheOp):
     """Standalone INTEL dequant_kv_cache implementation.
 
     Upstream removed this op class; we keep it here for int8/float8
@@ -313,6 +315,3 @@ class DequantKVCacheOp(BasicOp):
                         dequant_v_cache[b:b+1, :, :kv_len, :] = src_v * v_s
 
         return dequant_k_cache, dequant_v_cache
-
-
-OP_MAPPING = {"dequant_kv_cache": DequantKVCacheOp}
