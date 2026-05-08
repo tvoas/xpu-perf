@@ -48,7 +48,7 @@ def _load_ark():
         raise FileNotFoundError(f"ark dir not found: {ark_dir}")
 
     # Import wrapper package that exposes ARK and internally loads auto_round_kernel_xpu.
-    sys.path.insert(0, str(ark_dir))
+    os.sys.path.insert(0, str(ark_dir))
     import auto_round_kernel
 
     _ark_instance = auto_round_kernel.ARK()
