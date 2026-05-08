@@ -5,6 +5,8 @@ Fuses int8→bf16 cast + scale multiply into a single kernel,
 eliminating the intermediate bf16 tensor and saving ~2x memory traffic
 compared to the two-step torch path (copy_ + mul_).
 """
+from functools import partial
+import torch
 from xpu_perf.micro_perf.core.op import ProviderRegistry
 import os
 import pathlib
@@ -26,8 +28,6 @@ else:
     _spec_dq.loader.exec_module(_mod_dq)
     DequantKVCacheOp = _mod_dq.DequantKVCacheOp
 
-import torch
-from functools import partial
 
 # Load the compiled SYCL extension
 _SYCL_SO = os.path.join(os.path.dirname(__file__), "dequant_kv_cache_sycl.so")
@@ -58,6 +58,10 @@ try:
 
             bs = self.batch_size
             kv_len = self.kv_lens[0]
+            uniform_kv_lens = all(b_kv_len == kv_len for b_kv_len in self.kv_lens)
+
+            if self.cache_type != "linear" or not uniform_kv_lens:
+                return super().dequant_kv_cache_run(tensor_mapping)
 
             if self.dtype in ("float8", "float8_e4m3"):
                 # FP8 dequant: scale as bf16 (matching torch's .to(bfloat16) truncation)

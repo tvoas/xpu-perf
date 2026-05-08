@@ -1,10 +1,8 @@
-import pathlib
-from functools import partial
+import torch
+from xpu_perf.micro_perf.core.utils import static_quant
 
 from xpu_perf.micro_perf.core.op import ProviderRegistry
 BaseStoreKVCacheOp = ProviderRegistry.BASE_IMPL_MAPPING["store_kv_cache"]
-from xpu_perf.micro_perf.core.utils import static_quant
-import torch
 
 
 @ProviderRegistry.register_vendor_impl("store_kv_cache", "torch")
@@ -22,13 +20,22 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
         super().vendor_impl()
         self._run_func = self.vectorized_store_run
 
+    def _can_use_vectorized_linear_store(self):
+        uniform_lens = all(q_len == self.q_lens[0] for q_len in self.q_lens) and \
+            all(cache_len == self.cache_lens[0] for cache_len in self.cache_lens)
+        identity_slots = all(slot == batch_idx for batch_idx, slot in enumerate(self.slot_mapping))
+        return uniform_lens and identity_slots
+
     def vectorized_store_run(self, tensor_mapping):
         packed_qkv = tensor_mapping["packed_qkv"]
-        k_cache = tensor_mapping["k_cache"]
-        v_cache = tensor_mapping["v_cache"]
+        k_cache = tensor_mapping.get("k_cache")
+        v_cache = tensor_mapping.get("v_cache")
 
         k_scale = tensor_mapping.get("k_scale")
         v_scale = tensor_mapping.get("v_scale")
+
+        # Reshape from [num_tokens, total_dim] to [num_tokens, total_heads, head_dim]
+        packed_qkv = packed_qkv.view(-1, self.total_head_num, self.head_dim)
 
         if self.cache_type == "paged":
             return self._paged_store(packed_qkv, k_cache, v_cache, k_scale, v_scale)
@@ -37,8 +44,9 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
             q_len = self.q_lens[0]
             cache_len = self.cache_lens[0]
 
-            # For quant + large prefill, per-batch loop avoids huge float32 intermediates
-            if self.use_quant and q_len > 32:
+            # Fall back for non-uniform batches, non-identity slot mapping, or
+            # quant + large prefill where vectorization creates large fp32 temporaries.
+            if not self._can_use_vectorized_linear_store() or (self.use_quant and q_len > 32):
                 return self._per_batch_store(packed_qkv, k_cache, v_cache, k_scale, v_scale)
 
             k_head_start = self.q_head_num
@@ -63,37 +71,46 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
 
             if self.use_quant:
                 # Only reached for small q_len (decode), safe to materialize
-                scale_k = k_scale.view(1, self.kv_head_num, 1, self.head_dim)
-                scale_v = v_scale.view(1, self.kv_head_num, 1, self.head_dim)
+                scale_k = k_scale.view(1, self.kv_head_num, 1, self.head_dim) if k_scale is not None else None
+                scale_v = v_scale.view(1, self.kv_head_num, 1, self.head_dim) if v_scale is not None else None
 
                 if self.cache_torch_dtype == torch.int8:
                     max_val = 127.0
                 else:
                     raise ValueError(f"Unsupported cache dtype: {self.cache_torch_dtype}")
 
-                k_quant = src_k.float().mul_(scale_k).clamp_(-max_val, max_val)
-                v_quant = src_v.float().mul_(scale_v).clamp_(-max_val, max_val)
+                if k_cache is not None:
+                    if scale_k is None:
+                        raise ValueError("k_scale is required when storing quantized k_cache")
+                    k_quant = src_k.float().mul_(scale_k).clamp_(-max_val, max_val)
+                    if self.cache_torch_dtype == torch.int8:
+                        k_quant.round_()
+                    k_cache[:, :, cache_len:cache_end, :].copy_(k_quant.to(self.cache_torch_dtype))
 
-                if self.cache_torch_dtype == torch.int8:
-                    k_quant.round_()
-                    v_quant.round_()
-
-                k_cache[:, :, cache_len:cache_end, :].copy_(k_quant.to(self.cache_torch_dtype))
-                v_cache[:, :, cache_len:cache_end, :].copy_(v_quant.to(self.cache_torch_dtype))
+                if v_cache is not None:
+                    if scale_v is None:
+                        raise ValueError("v_scale is required when storing quantized v_cache")
+                    v_quant = src_v.float().mul_(scale_v).clamp_(-max_val, max_val)
+                    if self.cache_torch_dtype == torch.int8:
+                        v_quant.round_()
+                    v_cache[:, :, cache_len:cache_end, :].copy_(v_quant.to(self.cache_torch_dtype))
             else:
-                k_cache[:, :, cache_len:cache_end, :].copy_(src_k)
-                v_cache[:, :, cache_len:cache_end, :].copy_(src_v)
+                if k_cache is not None:
+                    k_cache[:, :, cache_len:cache_end, :].copy_(src_k)
+                if v_cache is not None:
+                    v_cache[:, :, cache_len:cache_end, :].copy_(src_v)
 
         return k_cache, v_cache
 
     def _per_batch_store(self, packed_qkv, k_cache, v_cache, k_scale, v_scale):
-        """Per-batch loop for quant prefill — avoids huge float32 intermediates."""
+        """Per-batch linear cache store."""
         k_head_start = self.q_head_num
         k_head_end = self.q_head_num + self.kv_head_num
         v_head_start = self.q_head_num + self.kv_head_num
         v_head_end = self.q_head_num + self.kv_head_num * 2
 
         for batch_idx in range(self.batch_size):
+            slot_idx = self.slot_mapping[batch_idx]
             q_len = self.q_lens[batch_idx]
             q_offset = self.accum_q_lens[batch_idx]
             cache_len = self.cache_lens[batch_idx]
@@ -104,10 +121,24 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
             src_v = packed_qkv[q_offset:q_offset + q_len, v_head_start:v_head_end, :]
 
             # Quantize and transpose to [kv_head_num, q_len, head_dim]
-            k_cache[batch_idx, :, cache_len:cache_end, :].copy_(
-                static_quant(src_k, k_scale, self.cache_torch_dtype).transpose(0, 1))
-            v_cache[batch_idx, :, cache_len:cache_end, :].copy_(
-                static_quant(src_v, v_scale, self.cache_torch_dtype).transpose(0, 1))
+            if self.use_quant:
+                if k_cache is not None:
+                    if k_scale is None:
+                        raise ValueError("k_scale is required when storing quantized k_cache")
+                    k_cache[slot_idx, :, cache_len:cache_end, :].copy_(
+                        static_quant(src_k, k_scale, self.cache_torch_dtype).transpose(0, 1))
+                if v_cache is not None:
+                    if v_scale is None:
+                        raise ValueError("v_scale is required when storing quantized v_cache")
+                    v_cache[slot_idx, :, cache_len:cache_end, :].copy_(
+                        static_quant(src_v, v_scale, self.cache_torch_dtype).transpose(0, 1))
+            else:
+                if k_cache is not None:
+                    k_cache[slot_idx, :, cache_len:cache_end, :].copy_(
+                        src_k.transpose(0, 1).to(self.cache_torch_dtype))
+                if v_cache is not None:
+                    v_cache[slot_idx, :, cache_len:cache_end, :].copy_(
+                        src_v.transpose(0, 1).to(self.cache_torch_dtype))
 
         return k_cache, v_cache
 
@@ -117,8 +148,8 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
         v_head_start = self.q_head_num + self.kv_head_num
 
         if self.use_quant:
-            scale_k = k_scale.view(self.kv_head_num, self.head_dim)
-            scale_v = v_scale.view(self.kv_head_num, self.head_dim)
+            scale_k = k_scale.view(self.kv_head_num, self.head_dim) if k_scale is not None else None
+            scale_v = v_scale.view(self.kv_head_num, self.head_dim) if v_scale is not None else None
             if self.cache_torch_dtype == torch.int8:
                 max_val = 127.0
             else:
@@ -140,12 +171,20 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
                 src_v = src_token[v_head_start:v_head_start + self.kv_head_num, :]
 
                 if self.use_quant:
-                    k_q = src_k.float().mul(scale_k).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
-                    v_q = src_v.float().mul(scale_v).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
-                    k_cache[physical_block, :, block_offset, :] = k_q
-                    v_cache[physical_block, :, block_offset, :] = v_q
+                    if k_cache is not None:
+                        if scale_k is None:
+                            raise ValueError("k_scale is required when storing quantized k_cache")
+                        k_q = src_k.float().mul(scale_k).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
+                        k_cache[physical_block, :, block_offset, :] = k_q
+                    if v_cache is not None:
+                        if scale_v is None:
+                            raise ValueError("v_scale is required when storing quantized v_cache")
+                        v_q = src_v.float().mul(scale_v).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
+                        v_cache[physical_block, :, block_offset, :] = v_q
                 else:
-                    k_cache[physical_block, :, block_offset, :] = src_k
-                    v_cache[physical_block, :, block_offset, :] = src_v
+                    if k_cache is not None:
+                        k_cache[physical_block, :, block_offset, :] = src_k
+                    if v_cache is not None:
+                        v_cache[physical_block, :, block_offset, :] = src_v
 
         return k_cache, v_cache

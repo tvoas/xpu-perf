@@ -1,9 +1,9 @@
+from functools import partial
+import pathlib
 import torch
 from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size, get_torch_dtype, get_attn_info
 from xpu_perf.micro_perf.core.op import ProviderRegistry
 BaseDequantKVCacheOp = ProviderRegistry.BASE_IMPL_MAPPING["dequant_kv_cache"]
-import pathlib
-from functools import partial
 
 try:
     import triton
@@ -167,7 +167,7 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
 
         elif self.cache_type == "paged":
             self.input_tensor_info["block_table"] = OpTensorInfo(
-                shape=[self.batch_size, self.max_block_num_per_seq],
+                shape=[self.target_batch_size, self.target_per_seq_num_block],
                 dtype=torch.int32,
                 device=self.backend.get_torch_device_name(),
                 creator=lambda size, dtype, device: torch.tensor(
@@ -175,25 +175,25 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 ),
             )
             self.input_tensor_info["k_cache"] = OpTensorInfo(
-                shape=[self.num_kv_blocks, self.kv_head_num, self.block_size, self.head_dim],
+                shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty,
             )
             self.input_tensor_info["v_cache"] = OpTensorInfo(
-                shape=[self.num_kv_blocks, self.kv_head_num, self.block_size, self.head_dim],
+                shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty,
             )
             self.output_tensor_info["dequant_k_cache"] = OpTensorInfo(
-                shape=[self.num_kv_blocks, self.kv_head_num, self.block_size, self.head_dim],
+                shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.dst_torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty,
             )
             self.output_tensor_info["dequant_v_cache"] = OpTensorInfo(
-                shape=[self.num_kv_blocks, self.kv_head_num, self.block_size, self.head_dim],
+                shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.dst_torch_dtype,
                 device=self.backend.get_torch_device_name(),
                 creator=torch.empty,
@@ -239,25 +239,25 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
         elif self.cache_type == "paged":
             self.read_bytes += (
                 calc_tensor_size(self.input_tensor_info["block_table"])
-                / self.batch_size
-                / self.max_block_num_per_seq
+                / self.target_batch_size
+                / self.target_per_seq_num_block
                 * self.num_kv_blocks
                 + calc_tensor_size(self.input_tensor_info["k_cache"])
-                / self.num_kv_blocks
+                / self.total_cache_blocks
                 / self.block_size
                 * self.num_kv_tokens
                 + calc_tensor_size(self.input_tensor_info["v_cache"])
-                / self.num_kv_blocks
+                / self.total_cache_blocks
                 / self.block_size
                 * self.num_kv_tokens
             )
             self.write_bytes = (
                 calc_tensor_size(self.output_tensor_info["dequant_k_cache"])
-                / self.num_kv_blocks
+                / self.total_cache_blocks
                 / self.block_size
                 * self.num_kv_tokens
                 + calc_tensor_size(self.output_tensor_info["dequant_v_cache"])
-                / self.num_kv_blocks
+                / self.total_cache_blocks
                 / self.block_size
                 * self.num_kv_tokens
             )
@@ -279,27 +279,37 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
         dequant_k_cache = tensor_mapping["dequant_k_cache"]
         dequant_v_cache = tensor_mapping["dequant_v_cache"]
 
-        kv_lens = tensor_mapping["kv_lens"]
         k_scale = tensor_mapping["k_scale"]
         v_scale = tensor_mapping["v_scale"]
 
+        k_s = k_scale.to(self.dst_torch_dtype).view(1, self.kv_head_num, 1, self.head_dim)
+        v_s = v_scale.to(self.dst_torch_dtype).view(1, self.kv_head_num, 1, self.head_dim)
+
         if self.cache_type == "paged":
-            block_table = tensor_mapping["block_table"]
-            raise NotImplementedError(
-                "DequantKVCacheOp paged cache not implemented yet."
-            )
+            for batch_idx in range(self.batch_size):
+                kv_len = self.kv_lens[batch_idx]
+                for pos in range(kv_len):
+                    block_idx = pos // self.block_size
+                    block_offset = pos % self.block_size
+                    physical_block = self.block_table[batch_idx][block_idx]
+
+                    dequant_k_cache[physical_block, :, block_offset, :] = \
+                        k_cache[physical_block, :, block_offset, :].to(self.dst_torch_dtype) * k_s.view(self.kv_head_num, self.head_dim)
+                    dequant_v_cache[physical_block, :, block_offset, :] = \
+                        v_cache[physical_block, :, block_offset, :].to(self.dst_torch_dtype) * v_s.view(self.kv_head_num, self.head_dim)
+
+            return dequant_k_cache, dequant_v_cache
 
         if self.cache_type == "linear":
             kv_len = self.kv_lens[0]
+            uniform_kv_lens = all(b_kv_len == kv_len for b_kv_len in self.kv_lens)
 
-            if HAS_TRITON and self.kv_head_num > 4:
+            if HAS_TRITON and self.kv_head_num > 4 and uniform_kv_lens:
                 k_scale_bf16 = k_scale.to(self.dst_torch_dtype)
                 v_scale_bf16 = v_scale.to(self.dst_torch_dtype)
                 triton_fused_dequant(k_cache, k_scale_bf16, dequant_k_cache, kv_len)
                 triton_fused_dequant(v_cache, v_scale_bf16, dequant_v_cache, kv_len)
-            else:
-                k_s = k_scale.to(self.dst_torch_dtype).unsqueeze(0).unsqueeze(2)
-                v_s = v_scale.to(self.dst_torch_dtype).unsqueeze(0).unsqueeze(2)
+            elif uniform_kv_lens:
                 if self.batch_size <= 4:
                     # Vectorized: good for small batch
                     src_k = k_cache[:, :, :kv_len, :].to(self.dst_torch_dtype)
@@ -309,9 +319,18 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 else:
                     # Per-batch: avoids huge temporaries for large batch
                     for b in range(self.batch_size):
-                        src_k = k_cache[b:b+1, :, :kv_len, :].to(self.dst_torch_dtype)
-                        src_v = v_cache[b:b+1, :, :kv_len, :].to(self.dst_torch_dtype)
-                        dequant_k_cache[b:b+1, :, :kv_len, :] = src_k * k_s
-                        dequant_v_cache[b:b+1, :, :kv_len, :] = src_v * v_s
+                        slot_idx = self.slot_mapping[b]
+                        src_k = k_cache[slot_idx:slot_idx+1, :, :kv_len, :].to(self.dst_torch_dtype)
+                        src_v = v_cache[slot_idx:slot_idx+1, :, :kv_len, :].to(self.dst_torch_dtype)
+                        dequant_k_cache[slot_idx:slot_idx+1, :, :kv_len, :] = src_k * k_s
+                        dequant_v_cache[slot_idx:slot_idx+1, :, :kv_len, :] = src_v * v_s
+            else:
+                for b in range(self.batch_size):
+                    slot_idx = self.slot_mapping[b]
+                    b_kv_len = self.kv_lens[b]
+                    src_k = k_cache[slot_idx:slot_idx+1, :, :b_kv_len, :].to(self.dst_torch_dtype)
+                    src_v = v_cache[slot_idx:slot_idx+1, :, :b_kv_len, :].to(self.dst_torch_dtype)
+                    dequant_k_cache[slot_idx:slot_idx+1, :, :b_kv_len, :] = src_k * k_s
+                    dequant_v_cache[slot_idx:slot_idx+1, :, :b_kv_len, :] = src_v * v_s
 
         return dequant_k_cache, dequant_v_cache
