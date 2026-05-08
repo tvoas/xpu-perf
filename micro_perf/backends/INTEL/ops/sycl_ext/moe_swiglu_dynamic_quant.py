@@ -32,6 +32,7 @@ class SyclExtMoeSwigluDynamicQuantOp(MoeSwigluDynamicQuantOp):
         smooth_scale = tensor_mapping["smooth_scale"]
         experts_token_count = tensor_mapping["experts_token_count"]
         experts_token_start = tensor_mapping["experts_token_start"]
+        scatter_expert_ids = tensor_mapping["scatter_expert_ids"]
 
         quant_tokens = tensor_mapping["quant_tokens"]
         per_token_scale = tensor_mapping["per_token_scale"]
@@ -44,6 +45,7 @@ class SyclExtMoeSwigluDynamicQuantOp(MoeSwigluDynamicQuantOp):
             smooth_scale,
             experts_token_count,
             experts_token_start,
+            scatter_expert_ids,
             quant_tokens,
             per_token_scale,
             total_experts_num,

@@ -20,10 +20,10 @@ try:
 
         def moe_scatter_dynamic_quant_run(self, tensor_mapping):
             hidden_states = tensor_mapping["hidden_states"]
-            selected_experts = tensor_mapping["selected_experts"]
+            selected_experts = tensor_mapping["selected_experts_local"]
             moe_weights = tensor_mapping["moe_weights"]
             token_to_scatter_offset = tensor_mapping["token_to_scatter_offset"]
-            smooth_scale = tensor_mapping["smooth_scale"]
+            smooth_scale = tensor_mapping["smooth_scale_local"]
 
             scatter_tokens = tensor_mapping["scatter_tokens"]
             scatter_per_token_scale = tensor_mapping["scatter_per_token_scale"]
@@ -69,11 +69,11 @@ try:
             smooth_scale = tensor_mapping["smooth_scale"]
             experts_token_count = tensor_mapping["experts_token_count"]
             experts_token_start = tensor_mapping["experts_token_start"]
+            scatter_expert_ids = tensor_mapping["scatter_expert_ids"]
 
             quant_tokens = tensor_mapping["quant_tokens"]
             per_token_scale = tensor_mapping["per_token_scale"]
 
-            # C++ backend takes total experts instead of experts per rank
             total_experts_num = experts_token_count.size(0)
             max_token_num = int(experts_token_count.max().item())
 
@@ -82,6 +82,7 @@ try:
                 smooth_scale,
                 experts_token_count,
                 experts_token_start,
+                scatter_expert_ids,
                 quant_tokens,
                 per_token_scale,
                 total_experts_num,

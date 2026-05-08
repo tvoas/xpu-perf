@@ -3100,6 +3100,11 @@ class MoeSwigluDynamicQuantOp(BasicOp):
             self.num_tokens, self.num_experts, self.topk, 
             ep_size=self.ep_size, ep_rank=self.ep_rank
         )        
+        self.scatter_expert_ids = [
+            expert_idx
+            for expert_idx, token_count in enumerate(self.expert_dispatch_token_count)
+            for _ in range(token_count)
+        ]
 
         self.scatter_expert_ids = [
             expert_idx

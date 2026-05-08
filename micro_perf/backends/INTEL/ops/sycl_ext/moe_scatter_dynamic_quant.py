@@ -29,10 +29,10 @@ class SyclExtMoeScatterDynamicQuantOp(MoeScatterDynamicQuantOp):
             raise RuntimeError("moe_scatter_dynamic_quant_sycl.so not found. Did you run build.sh?")
 
         hidden_states = tensor_mapping["hidden_states"]
-        selected_experts = tensor_mapping["selected_experts"]
+        selected_experts = tensor_mapping["selected_experts_local"]
         moe_weights = tensor_mapping["moe_weights"]
         token_to_scatter_offset = tensor_mapping["token_to_scatter_offset"]
-        smooth_scale = tensor_mapping["smooth_scale"]
+        smooth_scale = tensor_mapping["smooth_scale_local"]
 
         scatter_tokens = tensor_mapping["scatter_tokens"]
         scatter_per_token_scale = tensor_mapping["scatter_per_token_scale"]
