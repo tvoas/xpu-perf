@@ -157,6 +157,34 @@ icpx -fsycl -fsycl-targets=spir64_gen -Xs "-device bmg-g21" \
 echo "Built: $SCRIPT_DIR/scale_dynamic_quant_sycl.so"
 ls -la scale_dynamic_quant_sycl.so
 
+echo ""
+echo "Building moe_swiglu_dynamic_quant SYCL extension..."
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=moe_swiglu_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    moe_swiglu_dynamic_quant_kernel.cpp \
+    -o moe_swiglu_dynamic_quant_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+echo "Built: $SCRIPT_DIR/moe_swiglu_dynamic_quant_sycl.so"
+ls -la moe_swiglu_dynamic_quant_sycl.so
+
+echo ""
+echo "Building moe_scatter_dynamic_quant SYCL extension..."
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=moe_scatter_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    moe_scatter_dynamic_quant_kernel.cpp \
+    -o moe_scatter_dynamic_quant_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+echo "Built: $SCRIPT_DIR/moe_scatter_dynamic_quant_sycl.so"
+ls -la moe_scatter_dynamic_quant_sycl.so
+
 echo "Building bmg_moe_gating_gemm_sycl SYCL extension..."
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=bmg_moe_gating_gemm_sycl \
