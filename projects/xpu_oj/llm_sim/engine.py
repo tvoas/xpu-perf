@@ -783,8 +783,8 @@ class XpuPerfSimEngine:
         self.parallel_config_str = self.dist_info.get_dist_info_str()
 
 
-        # 获取 bench_mode
-        self.run_mode = kwargs.get("run_mode", "prefill")
+        # 获取 bench_mode（run_mode 已在 __init__ 中设置，此处仅允许 kwargs 覆盖）
+        self.run_mode = kwargs.get("run_mode", self.run_mode)
         self.ori_num_layers = self.model_config.num_layers[0]
         self.test_num_layers = self.ori_num_layers
         num_layers = self.ori_num_layers

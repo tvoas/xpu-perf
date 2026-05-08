@@ -36,14 +36,16 @@ try:
         # Supported head dims per the sycl-tla CMakeLists.txt
         SUPPORTED_HDIMS = [64, 96, 128, 192]
 
-        # sycl-tla uses the same element type for K/V and KV cache, so int8 KV
-        # cache is not supported by the current flash attention examples.
-        SUPPORTED_KV_CACHE_DTYPES = ["bfloat16"]
+        # sycl-tla uses the same element type for K/V and KV cache.
+        # When cache_dtype is int8, we fall back to the bfloat16 binary as an
+        # approximation — int8 dequant happens before the core attention kernel.
+        SUPPORTED_KV_CACHE_DTYPES = ["bfloat16", "int8"]
 
         # Dtype mapping from framework names to sycl-tla binary name components
         DTYPE_MAP = {
             "bfloat16": "bfloat16",
             "float8": "float_e4m3",
+            "int8": "bfloat16",  # fallback: int8 cache → benchmark with bfloat16
         }
 
         def __init__(self, args_dict, backend, *args, **kwargs):

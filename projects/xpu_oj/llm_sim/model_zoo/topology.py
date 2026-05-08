@@ -259,10 +259,18 @@ class OpTopologyDAG:
 
             avail_providers = list(target_result.keys())
             try:
-                target_provider = avail_providers[0]
+                # Filter to providers that have valid latency data
+                valid_providers = [
+                    p for p in avail_providers
+                    if isinstance(target_result[p], dict) and "latency(us)" in target_result[p]
+                ]
+                if not valid_providers:
+                    raise KeyError("No provider has latency(us)")
+
+                target_provider = valid_providers[0]
                 target_latency = target_result[target_provider]["latency(us)"]
 
-                for provider in avail_providers:
+                for provider in valid_providers[1:]:
                     if target_result[provider]["latency(us)"] < target_latency:
                         target_provider = provider
                         target_latency = target_result[provider]["latency(us)"]

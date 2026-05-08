@@ -1,0 +1,30 @@
+{
+    "base_model_name": "qwen3_dense", 
+    "model_name": "qwen3-32b", 
+    "infer_dtype": "gemm{w8a8_fp8}_fa{c8_fp8}", 
+    "dtype_config": {
+        "default_dtype": "bfloat16", 
+        "qkvo": {
+            "dtype": "float8", 
+            "w_dtype": "float8", 
+            "compute_dtype": "float8"
+        }, 
+        "attn": {
+            "dtype": "bfloat16", 
+            "cache_dtype": "float8", 
+            "qk_compute_dtype": "bfloat16", 
+            "pv_compute_dtype": "bfloat16"
+        }, 
+        "mlp": {
+            "dtype": "float8", 
+            "w_dtype": "float8", 
+            "compute_dtype": "float8"
+        }
+    }, 
+    "parallel_config": {
+        "device_num": 8, 
+        "tp_size": 8
+    }, 
+    "extra_config": {}, 
+    "template": "model_zoo.qwen3_dense.qwen3-32b.deploys.tp"
+}

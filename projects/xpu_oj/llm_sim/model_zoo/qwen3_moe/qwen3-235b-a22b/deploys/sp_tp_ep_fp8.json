@@ -1,0 +1,36 @@
+{
+    "base_model_name": "qwen3_moe", 
+    "model_name": "qwen3-235b-a22b", 
+    "infer_dtype": "gemm{w8a8_fp8}_fa{c8_fp8}", 
+    "dtype_config": {
+        "default_dtype": "bfloat16", 
+        "qkvo": {
+            "dtype": "float8", 
+            "w_dtype": "float8", 
+            "compute_dtype": "float8"
+        }, 
+        "attn": {
+            "dtype": "bfloat16", 
+            "cache_dtype": "float8", 
+            "qk_compute_dtype": "bfloat16", 
+            "pv_compute_dtype": "bfloat16"
+        }, 
+        "gating": {
+            "dtype": "float32", 
+            "compute_dtype": "float32"
+        }, 
+        "mlp": {
+            "dtype": "float8", 
+            "w_dtype": "float8", 
+            "compute_dtype": "float8"
+        }
+    }, 
+    "parallel_config": {
+        "device_num": 8, 
+        "sp_size": 8, 
+        "tp_size": 8, 
+        "ep_size": 8
+    }, 
+    "extra_config": {}, 
+    "template": "model_zoo.qwen3_moe.qwen3-235b-a22b.deploys.sp_tp_ep"
+}
