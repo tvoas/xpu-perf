@@ -182,6 +182,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
+
 echo "Built: $SCRIPT_DIR/moe_scatter_dynamic_quant_sycl.so"
 ls -la moe_scatter_dynamic_quant_sycl.so
 
