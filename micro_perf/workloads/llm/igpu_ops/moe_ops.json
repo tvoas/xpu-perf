@@ -2,8 +2,8 @@
     "moe_scatter_dynamic_quant": [
         {
             "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
+            "dtype": ["bfloat16", "float16"],
+            "dst_dtype": ["int8", "float8_e4m3fn"],
             "world_size.rank": [
                 [1, 0]
             ],
@@ -11,18 +11,20 @@
                 [0, 1, 1]
             ],
             "num_experts.ep_size": [
-                [256, 1]
+                [256, 1],
+                [128, 1],
+                [64, 1]
             ],
-            "hidden_size": [7168],
-            "num_tokens": [40, 80, 4096],
-            "topk": [5, 8]
+            "hidden_size": [128, 256, 512, 1024, 2048, 4096, 7168, 8192],
+            "num_tokens": [1, 16, 40, 80, 128, 256, 512, 1024, 2048, 4096],
+            "topk": [2, 5, 8]
         }
     ],
     "moe_swiglu_dynamic_quant": [
         {
             "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
+            "dtype": ["bfloat16", "float16"],
+            "dst_dtype": ["int8", "float8_e4m3fn"],
             "world_size.rank": [
                 [1, 0]
             ],
@@ -30,10 +32,12 @@
                 [0, 1, 1]
             ],
             "num_experts.topk.ep_size": [
-                [256, 8, 1]
+                [256, 8, 1],
+                [128, 8, 1],
+                [64, 8, 1]
             ],
-            "hidden_size": [2048],
-            "num_tokens": [40, 80, 4096]
+            "hidden_size": [128, 256, 512, 1024, 2048, 4096, 7168, 8192],
+            "num_tokens": [1, 16, 40, 80, 128, 256, 512, 1024, 2048, 4096]
         }
     ]
 }

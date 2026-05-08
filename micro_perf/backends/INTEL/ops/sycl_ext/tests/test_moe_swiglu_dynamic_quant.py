@@ -41,7 +41,7 @@ def baseline_moe_swiglu(scatter_tokens, smooth_scale, experts_token_count, exper
         quant_tokens = torch.round(scaled / scale.unsqueeze(-1)).to(torch.int8)
     else:
         quant_tokens = (scaled / scale.unsqueeze(-1)).to(torch.float8_e4m3fn)
-        
+
     per_token_scale = scale
 
     return quant_tokens, per_token_scale, unquantized_math
@@ -96,12 +96,12 @@ def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts, src_d
     if dst_dtype == torch.int8:
         diff = (out_quant_tokens.int() - ref_quant_tokens.int()).abs()
         assert diff.max().item() <= 1, "Quantized values diverge completely!"
-        
+
     custom_dequantized = out_quant_tokens.float() * out_per_scale.unsqueeze(1)
     ref_dequantized = ref_quant_tokens.float() * ref_per_scale.unsqueeze(1)
-    
+
     float_diff = (custom_dequantized - ref_dequantized).abs()
-        
+
     if dst_dtype == torch.int8:
         assert float_diff.max().item() < 0.5, f"INT8 dequantized math outputs diverge! Error: {float_diff.max().item()}"
     else:

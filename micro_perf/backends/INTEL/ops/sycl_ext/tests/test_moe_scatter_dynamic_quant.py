@@ -51,7 +51,7 @@ def baseline_moe_scatter(selected_experts, moe_weights, hidden_states, experts_s
     max_vals = smoothed.abs().max(dim=-1).values
     scale = max_vals / quant_max
     scale = torch.where(scale == 0, torch.tensor(1.0, device=device), scale)
-    
+
     if dst_dtype == torch.int8:
         quantized = torch.round(smoothed / scale.unsqueeze(-1)).to(torch.int8)
     else:
@@ -85,13 +85,13 @@ def baseline_moe_scatter(selected_experts, moe_weights, hidden_states, experts_s
 @pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
 def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts, shared_experts_num, src_dtype, dst_dtype):
     device = "xpu"
-    
+
     total_experts = num_experts + shared_experts_num
     total_topk = topk + shared_experts_num
 
     # Base routing for normal experts
     routed_experts = torch.rand((num_tokens, num_experts), device=device).topk(topk, dim=-1).indices.to(torch.int32)
-    
+
     # Append shared experts (they always process every token, usually placed at the end of expert list)
     if shared_experts_num > 0:
         shared_ids = torch.arange(num_experts, total_experts, dtype=torch.int32, device=device).unsqueeze(0).expand(num_tokens, shared_experts_num)
@@ -149,9 +149,9 @@ def test_moe_scatter_dynamic_quant(num_tokens, hidden_size, topk, num_experts, s
 
     custom_dequantized = out_scatter_tokens[sort_idx_custom].float() * out_per_scale[sort_idx_custom].unsqueeze(1)
     ref_dequantized = ref_scatter_tokens[sort_idx_ref].float() * ref_per_scale[sort_idx_ref].unsqueeze(1)
-    
+
     float_diff = (custom_dequantized - ref_dequantized).abs()
-        
+
     if dst_dtype == torch.int8:
         assert float_diff.max().item() < 0.5, f"INT8 dequantized math outputs diverge! Error: {float_diff.max().item()}"
     else:

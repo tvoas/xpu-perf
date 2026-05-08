@@ -25,12 +25,12 @@ inline simd<uint8_t, N> fast_cvt_float_to_e4m3fn(simd<float, N> x) {
 
     // Rounding tie-to-even approximation (add half of the 20-bit shifted fractional part)
     simd<uint32_t, N> rounded = abs_bits + 0x00080000;
-    
+
     simd<int32_t, N> exp = (rounded >> 23) - 127 + 7;
     simd<uint32_t, N> mantissa = (rounded & 0x7FFFFF) >> 20;
 
     simd<uint8_t, N> res = 0;
-    
+
     auto is_normal = (exp > 0) & (exp < 16);
     auto is_overflow = exp >= 16;
     auto is_underflow = exp <= 0;
@@ -93,12 +93,12 @@ void moe_swiglu_dynamic_quant_impl(
                 int left = 0;
                 int right = total_experts_num - 1;
                 int expert_idx = 0;
-                
+
                 while (left <= right) {
                     int mid = left + (right - left) / 2;
                     int start = experts_token_start_ptr[mid];
                     int count = experts_token_count_ptr[mid];
-                    
+
                     if (flat_idx >= start && flat_idx < start + count) {
                         expert_idx = mid;
                         break;
@@ -115,7 +115,7 @@ void moe_swiglu_dynamic_quant_impl(
 
                 simd<float, CHUNK> thread_max_vec = 0.0f;
 
-                // Pass 1: Read, compute, track extrema, and CACHE to SLM 
+                // Pass 1: Read, compute, track extrema, and CACHE to SLM
                 for (int bid = loc_id; bid < num_blocks; bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
@@ -128,7 +128,7 @@ void moe_swiglu_dynamic_quant_impl(
 
                         simd<float, CHUNK> sigmoid = sycl::ext::intel::esimd::inv(1.0f + sycl::ext::intel::esimd::exp(-simd<float, CHUNK>(x1)));
                         simd<float, CHUNK> scaled_swiglu_tokens = (simd<float, CHUNK>(x1) * sigmoid) * simd<float, CHUNK>(x2) * scale;
-                        
+
                         thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(scaled_swiglu_tokens));
 
                         // Write to SLM (Fallback 16-stride loop guarantees successful JIT on all formats)
@@ -156,7 +156,7 @@ void moe_swiglu_dynamic_quant_impl(
 
                     float raw_token_scale = max_value_final / quant_max;
                     this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
-                    
+
                     slm_block_store<float, 4>(reduction_base + 1024, simd<float, 4>(this_token_scale));
                 }
                 barrier();
@@ -170,7 +170,7 @@ void moe_swiglu_dynamic_quant_impl(
                     for (int u = 0; u < UNROLL; ++u) {
                         uint32_t base_offset = (bid * BS + u * CHUNK) * 4;
                         simd<float, CHUNK> cached_tokens;
-                        
+
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
                             cached_tokens.template select<16, 1>(i * 16) = slm_block_load<float, 16>(base_offset + i * 64);
@@ -216,38 +216,26 @@ void moe_swiglu_dynamic_quant_impl(
                                   return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
-    int total_swiglu_items = num_scattered;
-    
-    // The "inflection" threshold: Minimum total threads required to properly saturate the GPU.
-    //int target_total_threads = 1024;
-    //int target_total_threads = 2048;
-    //int target_total_threads = 3072;
-    //int target_total_threads = 4096;
-    //int target_total_threads = 6144;
-    //int target_total_threads = 8192;
-    //int target_total_threads = 10240;
-    //int target_total_threads = 12288;
-    //int target_total_threads = 16384;
-    //int target_total_threads = 24576;
-    //int target_total_threads = 32768;
-    //int target_total_threads = 768;
-    //int target_total_threads = 512;
-    //int target_total_threads = 256;
-    //int target_total_threads = 128;
-    int target_total_threads = 64;
+    int target_wg = 2;
 
-    auto is_valid_unroll = [&](int unroll) {
-        int bs = unroll * 64;
-        int max_wg_size = std::min(hidden_size / bs, 64);
-        return (hidden_size % bs == 0) && ((total_swiglu_items * max_wg_size) >= target_total_threads);
-    };
+    int num_chunks = hidden_size / 64;
+    int best_unroll = 1;
 
-    if (is_valid_unroll(32)) return dispatch_slm(std::integral_constant<int, 32>{});
-    if (is_valid_unroll(16)) return dispatch_slm(std::integral_constant<int, 16>{});
-    if (is_valid_unroll(8))  return dispatch_slm(std::integral_constant<int, 8>{});
-    if (is_valid_unroll(4))  return dispatch_slm(std::integral_constant<int, 4>{});
-    if (is_valid_unroll(2))  return dispatch_slm(std::integral_constant<int, 2>{});
-                             return dispatch_slm(std::integral_constant<int, 1>{});
+    // Find the largest UNROLL that cleanly divides memory AND
+    // preserves enough active blocks to meet target_wg.
+    for (int u : {8, 4, 2}) {
+        if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
+            best_unroll = u;
+            break;
+        }
+    }
+
+    switch (best_unroll) {
+        case 8:  return dispatch_slm(std::integral_constant<int, 8>{});
+        case 4:  return dispatch_slm(std::integral_constant<int, 4>{});
+        case 2:  return dispatch_slm(std::integral_constant<int, 2>{});
+        default: return dispatch_slm(std::integral_constant<int, 1>{});
+    }
 }
 
 // Outer dispatch macros to select implementation
@@ -297,12 +285,12 @@ void moe_swiglu_dynamic_quant(
     int64_t hidden_size = hidden_size2 / 2;
 
     // Block size alignment check for ESIMD vectorized loads
-    TORCH_CHECK(hidden_size >= 64 && hidden_size % 64 == 0, 
+    TORCH_CHECK(hidden_size >= 64 && hidden_size % 64 == 0,
                 "hidden_size must be a positive multiple of 64 for vectorized XPU block loads, got ", hidden_size);
 
-    TORCH_CHECK(quant_tokens.size(0) == num_scattered && quant_tokens.size(1) == hidden_size, 
+    TORCH_CHECK(quant_tokens.size(0) == num_scattered && quant_tokens.size(1) == hidden_size,
                 "quant_tokens shape mismatch");
-    TORCH_CHECK(smooth_scale.size(0) == total_experts_num && smooth_scale.size(1) == hidden_size, 
+    TORCH_CHECK(smooth_scale.size(0) == total_experts_num && smooth_scale.size(1) == hidden_size,
                 "smooth_scale shape mismatch");
     TORCH_CHECK(experts_token_count.size(0) == total_experts_num, "experts_token_count size mismatch");
     TORCH_CHECK(experts_token_start.size(0) == total_experts_num, "experts_token_start size mismatch");
@@ -311,9 +299,9 @@ void moe_swiglu_dynamic_quant(
     auto in_dtype = scatter_tokens.scalar_type();
     auto out_dtype = quant_tokens.scalar_type();
 
-    DISPATCH_MOE_QUANT_IMPL(moe_swiglu_dynamic_quant_impl, 
-                            scatter_tokens, smooth_scale, experts_token_count, 
-                            experts_token_start, quant_tokens, per_token_scale, 
+    DISPATCH_MOE_QUANT_IMPL(moe_swiglu_dynamic_quant_impl,
+                            scatter_tokens, smooth_scale, experts_token_count,
+                            experts_token_start, quant_tokens, per_token_scale,
                             total_experts_num, max_token_num);
 }
 

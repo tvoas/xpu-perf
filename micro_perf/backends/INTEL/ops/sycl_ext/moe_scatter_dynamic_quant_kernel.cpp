@@ -25,12 +25,12 @@ inline simd<uint8_t, N> fast_cvt_float_to_e4m3fn(simd<float, N> x) {
 
     // Rounding tie-to-even approximation (add half of the 20-bit shifted fractional part)
     simd<uint32_t, N> rounded = abs_bits + 0x00080000;
-    
+
     simd<int32_t, N> exp = (rounded >> 23) - 127 + 7;
     simd<uint32_t, N> mantissa = (rounded & 0x7FFFFF) >> 20;
 
     simd<uint8_t, N> res = 0;
-    
+
     auto is_normal = (exp > 0) & (exp < 16);
     auto is_overflow = exp >= 16;
     auto is_underflow = exp <= 0;
@@ -61,7 +61,7 @@ void moe_scatter_dynamic_quant_impl(
         return;
     }
 
-    // Python frontend concatenates shared experts into selected_experts, 
+    // Python frontend concatenates shared experts into selected_experts,
     // meaning the XPU kernel processes them uniformly via the topk dimension.
     (void)shared_experts_num;
 
@@ -71,7 +71,7 @@ void moe_scatter_dynamic_quant_impl(
     int n_expert = experts_token_count.size(0);
     int hd_size = hidden_states.size(1);
     int n_expert_total = n_expert;
-    
+
     constexpr float quant_max = QuantMax<T_out>::value;
 
     auto selected_experts_ptr = selected_experts.data_ptr<int32_t>();
@@ -79,15 +79,15 @@ void moe_scatter_dynamic_quant_impl(
     auto ext_tokens_start_ptr = experts_token_start.data_ptr<int32_t>();
     auto token_to_scatter_offset_ptr = token_to_scatter_offset.data_ptr<int32_t>();
 
-    // UNIFIED ROUTING PASS: Replaces Pass 0, Pass 1, and Pass 2, eliminating two 
+    // UNIFIED ROUTING PASS: Replaces Pass 0, Pass 1, and Pass 2, eliminating two
     // kernel launch overheads (~15us+ saved) and all global atomics.
     auto routing_event = queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int32_t, 1> local_expert_counts(n_expert_total, cgh);
-        
-        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)), 
+
+        cgh.parallel_for(sycl::nd_range<1>(sycl::range<1>(256), sycl::range<1>(256)),
         [=](sycl::nd_item<1> item) [[intel::kernel_args_restrict]] {
             int lid = item.get_local_id(0);
-            
+
             // 1. Zero out SLM histogram
             for (int i = lid; i < n_expert_total; i += 256) {
                 local_expert_counts[i] = 0;
@@ -110,7 +110,7 @@ void moe_scatter_dynamic_quant_impl(
             item.barrier(sycl::access::fence_space::local_space);
 
             // 3. Prefix sum & Export to Global Memory
-            // (A sequential loop inside a single thread is dramatically faster 
+            // (A sequential loop inside a single thread is dramatically faster
             // than launching a separate kernel for small expert counts)
             if (lid == 0) {
                 int32_t sum = 0;
@@ -144,10 +144,10 @@ void moe_scatter_dynamic_quant_impl(
             cgh.depends_on(routing_event);
             cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens * topk, wg_size), sycl::range<2>(1, wg_size)),
             [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                
+
                 const int token_k_idx = item.get_group(0);
                 const int expert_id = selected_experts_ptr[token_k_idx];
-                
+
                 if (expert_id < 0 || expert_id >= n_expert_total) {
                     return;
                 }
@@ -156,7 +156,7 @@ void moe_scatter_dynamic_quant_impl(
                 slm_init(1056);
 
                 const int loc_id = item.get_local_id(1);
-                
+
                 const int token_idx = token_k_idx / topk;
 
                 const int offset = token_to_scatter_offset_ptr[token_k_idx];
@@ -190,10 +190,10 @@ void moe_scatter_dynamic_quant_impl(
                 barrier();
 
                 float this_token_scale = 1.0f;
-                
+
                 if (loc_id == 0) {
                     float max_value_final = 0.0f;
-                    
+
                     for (int i = 0; i < wg_size; i++) {
                         simd<float, 4> val = slm_block_load<float, 4>(i * 16);
                         if (val[0] > max_value_final) max_value_final = val[0];
@@ -201,7 +201,7 @@ void moe_scatter_dynamic_quant_impl(
 
                     float raw_token_scale = max_value_final / quant_max;
                     this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
-                    
+
                     slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
                 }
                 barrier();
@@ -241,24 +241,8 @@ void moe_scatter_dynamic_quant_impl(
     };
 
     int total_scatter_items = n_tokens * topk;
-    
-    // The "inflection" threshold: Minimum total threads required to properly saturate the GPU.
-    //int target_total_threads = 1024;
-    //int target_total_threads = 2048;
-    //int target_total_threads = 3072;
-    //int target_total_threads = 4096;
-    //int target_total_threads = 6144;
-    //int target_total_threads = 8192;
-    //int target_total_threads = 10240;
-    //int target_total_threads = 12288;
-    //int target_total_threads = 16384;
-    //int target_total_threads = 24576;
-    //int target_total_threads = 32768;
-    //int target_total_threads = 768;
-    //int target_total_threads = 512;
-    //int target_total_threads = 256;
-    //int target_total_threads = 128;
-    int target_total_threads = 64;
+
+    int target_total_threads = 1024;
 
     auto is_valid_unroll = [&](int unroll) {
         int bs = unroll * 64;
@@ -332,16 +316,16 @@ void moe_scatter_dynamic_quant(
 
     // Block size alignment check for ESIMD vectorized loads
     int64_t hd_size = hidden_states.size(1);
-    TORCH_CHECK(hd_size >= 64 && hd_size % 64 == 0, 
+    TORCH_CHECK(hd_size >= 64 && hd_size % 64 == 0,
                 "hidden_states inner dimension must be a positive multiple of 64 for XPU block loads, got ", hd_size);
 
     auto in_dtype = hidden_states.scalar_type();
     auto out_dtype = scatter_tokens.scalar_type();
 
     DISPATCH_MOE_QUANT_IMPL(moe_scatter_dynamic_quant_impl,
-                            selected_experts, moe_weights, token_to_scatter_offset, 
-                            experts_token_count, experts_token_start, hidden_states, 
-                            experts_smooth_scale, scatter_tokens, scatter_per_token_scale, 
+                            selected_experts, moe_weights, token_to_scatter_offset,
+                            experts_token_count, experts_token_start, hidden_states,
+                            experts_smooth_scale, scatter_tokens, scatter_per_token_scale,
                             scatter_tokens_offset, shared_experts_num);
 }
 
