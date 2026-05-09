@@ -53,8 +53,9 @@ try:
                 # per-channel static scale: kv_head_num * head_dim for each requested cache stream
                 self.read_bytes += self.kv_head_num * self.head_dim * cache_streams * 4  # float32 scales
             if self.cache_type == "paged":
-                # one int32 block_table lookup per token in fallback path
-                self.read_bytes += self.num_tokens * 4
+                # SYCL paged kernel reads bs * num_blocks_per_seq entries from block_table
+                num_blocks_per_seq = (max(self.cache_lens) + self.num_tokens // self.batch_size + self.block_size - 1) // self.block_size
+                self.read_bytes += self.batch_size * num_blocks_per_seq * 4  # int32 block_table
             self.io_bytes = self.read_bytes + self.write_bytes
 
             self._run_func = self.sycl_store_kv_cache_run
@@ -74,62 +75,99 @@ try:
             identity_slots = self.cache_type != "linear" or \
                 all(slot == batch_idx for batch_idx, slot in enumerate(self.slot_mapping))
 
-            # SYCL kernel stores both K and V in linear cache only;
-            # fall back to torch logic for partial modes or paged cache.
-            if k_cache is None or v_cache is None or self.cache_type == "paged" or not uniform_lens or not identity_slots:
+            # SYCL kernel requires both K and V caches, and uniform lens
+            if k_cache is None or v_cache is None or not uniform_lens or not identity_slots:
                 packed_qkv_3d = packed_qkv.view(-1, self.total_head_num, self.head_dim)
                 v_head_start = k_head_start + self.kv_head_num
 
-                for batch_idx in range(bs):
-                    slot_idx = self.slot_mapping[batch_idx] if self.cache_type == "linear" else batch_idx
-                    bq_len = self.q_lens[batch_idx]
-                    q_offset = self.accum_q_lens[batch_idx]
-                    b_cache_len = self.cache_lens[batch_idx]
+                if self.cache_type == "paged":
+                    # Vectorized paged scatter: build index arrays, single write
+                    device = packed_qkv.device
+                    phys_list = []
+                    off_list = []
+                    for batch_idx in range(bs):
+                        bq_len = self.q_lens[batch_idx]
+                        b_cache_len = self.cache_lens[batch_idx]
+                        positions = torch.arange(bq_len, device=device) + b_cache_len
+                        block_indices = (positions // self.block_size).long()
+                        block_offsets = positions % self.block_size
+                        bt = torch.tensor(self.block_table[batch_idx], dtype=torch.long, device=device)
+                        phys_list.append(bt[block_indices])
+                        off_list.append(block_offsets)
 
-                    for token_idx in range(bq_len):
-                        src_token = packed_qkv_3d[q_offset + token_idx]
+                    phys = torch.cat(phys_list)
+                    offsets = torch.cat(off_list)
 
-                        if self.cache_type == "paged":
-                            global_pos = b_cache_len + token_idx
-                            block_idx = global_pos // self.block_size
-                            block_offset = global_pos % self.block_size
-                            physical_block = self.block_table[batch_idx][block_idx]
+                    src_k = packed_qkv_3d[:, k_head_start:k_head_start + self.kv_head_num, :]
+                    src_v = packed_qkv_3d[:, v_head_start:v_head_start + self.kv_head_num, :]
+
+                    if self.use_quant:
+                        if k_cache is not None:
+                            k_cache[phys, :, offsets, :] = static_quant(
+                                src_k, tensor_mapping["k_scale"], self.cache_torch_dtype)
+                        if v_cache is not None:
+                            v_cache[phys, :, offsets, :] = static_quant(
+                                src_v, tensor_mapping["v_scale"], self.cache_torch_dtype)
+                    else:
+                        if k_cache is not None:
+                            k_cache[phys, :, offsets, :] = src_k.to(self.cache_torch_dtype)
+                        if v_cache is not None:
+                            v_cache[phys, :, offsets, :] = src_v.to(self.cache_torch_dtype)
+                else:
+                    # Linear non-uniform/non-identity: per-batch slice copy
+                    for batch_idx in range(bs):
+                        slot_idx = self.slot_mapping[batch_idx]
+                        bq_len = self.q_lens[batch_idx]
+                        q_offset = self.accum_q_lens[batch_idx]
+                        b_cache_len = self.cache_lens[batch_idx]
+
+                        src_k = packed_qkv_3d[q_offset:q_offset + bq_len, k_head_start:k_head_start + self.kv_head_num, :]
+                        src_v = packed_qkv_3d[q_offset:q_offset + bq_len, v_head_start:v_head_start + self.kv_head_num, :]
+
+                        if self.use_quant:
                             if k_cache is not None:
-                                src_k = src_token[k_head_start:k_head_start + self.kv_head_num, :]
-                                if self.use_quant:
-                                    src_k = static_quant(src_k.reshape(1, -1), tensor_mapping["k_scale"], self.cache_torch_dtype).view(self.kv_head_num, self.head_dim)
-                                else:
-                                    src_k = src_k.to(self.cache_torch_dtype)
-                                k_cache[physical_block, :, block_offset, :] = src_k
+                                k_cache[slot_idx, :, b_cache_len:b_cache_len + bq_len, :] = static_quant(
+                                    src_k, tensor_mapping["k_scale"], self.cache_torch_dtype).transpose(0, 1)
                             if v_cache is not None:
-                                src_v = src_token[v_head_start:v_head_start + self.kv_head_num, :]
-                                if self.use_quant:
-                                    src_v = static_quant(src_v.reshape(1, -1), tensor_mapping["v_scale"], self.cache_torch_dtype).view(self.kv_head_num, self.head_dim)
-                                else:
-                                    src_v = src_v.to(self.cache_torch_dtype)
-                                v_cache[physical_block, :, block_offset, :] = src_v
+                                v_cache[slot_idx, :, b_cache_len:b_cache_len + bq_len, :] = static_quant(
+                                    src_v, tensor_mapping["v_scale"], self.cache_torch_dtype).transpose(0, 1)
                         else:
-                            pos = b_cache_len + token_idx
                             if k_cache is not None:
-                                src_k = src_token[k_head_start:k_head_start + self.kv_head_num, :]
-                                if self.use_quant:
-                                    src_k = static_quant(src_k.reshape(1, -1), tensor_mapping["k_scale"], self.cache_torch_dtype).view(self.kv_head_num, self.head_dim)
-                                else:
-                                    src_k = src_k.to(self.cache_torch_dtype)
-                                k_cache[slot_idx, :, pos, :] = src_k
+                                k_cache[slot_idx, :, b_cache_len:b_cache_len + bq_len, :] = src_k.transpose(0, 1).to(self.cache_torch_dtype)
                             if v_cache is not None:
-                                src_v = src_token[v_head_start:v_head_start + self.kv_head_num, :]
-                                if self.use_quant:
-                                    src_v = static_quant(src_v.reshape(1, -1), tensor_mapping["v_scale"], self.cache_torch_dtype).view(self.kv_head_num, self.head_dim)
-                                else:
-                                    src_v = src_v.to(self.cache_torch_dtype)
-                                v_cache[slot_idx, :, pos, :] = src_v
+                                v_cache[slot_idx, :, b_cache_len:b_cache_len + bq_len, :] = src_v.transpose(0, 1).to(self.cache_torch_dtype)
 
                 return k_cache, v_cache
 
             # Reshape packed_qkv from [num_tokens, total_dim] to [num_tokens, total_heads, head_dim]
             packed_qkv = packed_qkv.view(-1, self.total_head_num, self.head_dim)
 
+            if self.cache_type == "paged":
+                block_table = tensor_mapping["block_table"]
+                if self.use_quant:
+                    if self.cache_dtype in ("float8", "float8_e4m3"):
+                        _sycl_ext.store_kv_cache_fp8_paged(
+                            packed_qkv, k_cache, v_cache,
+                            tensor_mapping["k_scale"], tensor_mapping["v_scale"],
+                            block_table,
+                            k_head_start, self.kv_head_num,
+                            bs, q_len, cache_len)
+                    else:
+                        _sycl_ext.store_kv_cache_int8_paged(
+                            packed_qkv, k_cache, v_cache,
+                            tensor_mapping["k_scale"], tensor_mapping["v_scale"],
+                            block_table,
+                            k_head_start, self.kv_head_num,
+                            bs, q_len, cache_len)
+                else:
+                    _sycl_ext.store_kv_cache_bf16_paged(
+                        packed_qkv, k_cache, v_cache,
+                        block_table,
+                        k_head_start, self.kv_head_num,
+                        bs, q_len, cache_len)
+                return k_cache, v_cache
+
+            # Linear path: identity slots, uniform lens
             if self.use_quant:
                 k_scale = tensor_mapping["k_scale"]
                 v_scale = tensor_mapping["v_scale"]

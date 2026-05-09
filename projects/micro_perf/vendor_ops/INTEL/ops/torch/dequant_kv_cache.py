@@ -286,17 +286,26 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
         v_s = v_scale.to(self.dst_torch_dtype).view(1, self.kv_head_num, 1, self.head_dim)
 
         if self.cache_type == "paged":
+            device = k_cache.device
+            phys_list = []
+            off_list = []
             for batch_idx in range(self.batch_size):
                 kv_len = self.kv_lens[batch_idx]
-                for pos in range(kv_len):
-                    block_idx = pos // self.block_size
-                    block_offset = pos % self.block_size
-                    physical_block = self.block_table[batch_idx][block_idx]
+                positions = torch.arange(kv_len, device=device)
+                block_indices = (positions // self.block_size).long()
+                block_offsets = positions % self.block_size
+                bt = torch.tensor(self.block_table[batch_idx], dtype=torch.long, device=device)
+                phys_list.append(bt[block_indices])
+                off_list.append(block_offsets)
 
-                    dequant_k_cache[physical_block, :, block_offset, :] = \
-                        k_cache[physical_block, :, block_offset, :].to(self.dst_torch_dtype) * k_s.view(self.kv_head_num, self.head_dim)
-                    dequant_v_cache[physical_block, :, block_offset, :] = \
-                        v_cache[physical_block, :, block_offset, :].to(self.dst_torch_dtype) * v_s.view(self.kv_head_num, self.head_dim)
+            phys = torch.cat(phys_list)
+            offsets = torch.cat(off_list)
+
+            k_s_2d = k_s.view(self.kv_head_num, self.head_dim)
+            v_s_2d = v_s.view(self.kv_head_num, self.head_dim)
+
+            dequant_k_cache[phys, :, offsets, :] = k_cache[phys, :, offsets, :].to(self.dst_torch_dtype) * k_s_2d
+            dequant_v_cache[phys, :, offsets, :] = v_cache[phys, :, offsets, :].to(self.dst_torch_dtype) * v_s_2d
 
             return dequant_k_cache, dequant_v_cache
 

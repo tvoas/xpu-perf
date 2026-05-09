@@ -143,48 +143,53 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
         return k_cache, v_cache
 
     def _paged_store(self, packed_qkv, k_cache, v_cache, k_scale, v_scale):
-        """Paged cache store: write tokens into physical blocks via block_table."""
+        """Vectorized paged cache store: single scatter instead of per-token loop."""
+        device = packed_qkv.device
         k_head_start = self.q_head_num
         v_head_start = self.q_head_num + self.kv_head_num
 
+        # Build scatter indices: map each token → (physical_block, block_offset)
+        phys_list = []
+        off_list = []
+        for batch_idx in range(self.batch_size):
+            q_len = self.q_lens[batch_idx]
+            cache_len = self.cache_lens[batch_idx]
+            positions = torch.arange(q_len, device=device) + cache_len
+            block_indices = (positions // self.block_size).long()
+            block_offsets = positions % self.block_size
+            bt = torch.tensor(self.block_table[batch_idx], dtype=torch.long, device=device)
+            phys_list.append(bt[block_indices])
+            off_list.append(block_offsets)
+
+        phys = torch.cat(phys_list)     # [num_tokens]
+        offsets = torch.cat(off_list)   # [num_tokens]
+
+        # Extract K, V: [num_tokens, kv_head_num, head_dim]
+        src_k = packed_qkv[:, k_head_start:k_head_start + self.kv_head_num, :]
+        src_v = packed_qkv[:, v_head_start:v_head_start + self.kv_head_num, :]
+
         if self.use_quant:
-            scale_k = k_scale.view(self.kv_head_num, self.head_dim) if k_scale is not None else None
-            scale_v = v_scale.view(self.kv_head_num, self.head_dim) if v_scale is not None else None
+            scale_k = k_scale.view(1, self.kv_head_num, self.head_dim) if k_scale is not None else None
+            scale_v = v_scale.view(1, self.kv_head_num, self.head_dim) if v_scale is not None else None
             if self.cache_torch_dtype == torch.int8:
                 max_val = 127.0
             else:
                 raise ValueError(f"Unsupported cache dtype: {self.cache_torch_dtype}")
 
-        for batch_idx in range(self.batch_size):
-            q_len = self.q_lens[batch_idx]
-            q_offset = self.accum_q_lens[batch_idx]
-            cache_len = self.cache_lens[batch_idx]
-
-            for token_idx in range(q_len):
-                global_pos = cache_len + token_idx
-                block_idx = global_pos // self.block_size
-                block_offset = global_pos % self.block_size
-                physical_block = self.block_table[batch_idx][block_idx]
-
-                src_token = packed_qkv[q_offset + token_idx]
-                src_k = src_token[k_head_start:k_head_start + self.kv_head_num, :]
-                src_v = src_token[v_head_start:v_head_start + self.kv_head_num, :]
-
-                if self.use_quant:
-                    if k_cache is not None:
-                        if scale_k is None:
-                            raise ValueError("k_scale is required when storing quantized k_cache")
-                        k_q = src_k.float().mul(scale_k).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
-                        k_cache[physical_block, :, block_offset, :] = k_q
-                    if v_cache is not None:
-                        if scale_v is None:
-                            raise ValueError("v_scale is required when storing quantized v_cache")
-                        v_q = src_v.float().mul(scale_v).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
-                        v_cache[physical_block, :, block_offset, :] = v_q
-                else:
-                    if k_cache is not None:
-                        k_cache[physical_block, :, block_offset, :] = src_k
-                    if v_cache is not None:
-                        v_cache[physical_block, :, block_offset, :] = src_v
+            if k_cache is not None:
+                if scale_k is None:
+                    raise ValueError("k_scale is required when storing quantized k_cache")
+                k_q = src_k.float().mul(scale_k).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
+                k_cache[phys, :, offsets, :] = k_q
+            if v_cache is not None:
+                if scale_v is None:
+                    raise ValueError("v_scale is required when storing quantized v_cache")
+                v_q = src_v.float().mul(scale_v).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
+                v_cache[phys, :, offsets, :] = v_q
+        else:
+            if k_cache is not None:
+                k_cache[phys, :, offsets, :] = src_k.to(self.cache_torch_dtype)
+            if v_cache is not None:
+                v_cache[phys, :, offsets, :] = src_v.to(self.cache_torch_dtype)
 
         return k_cache, v_cache

@@ -60,14 +60,36 @@ try:
             kv_len = self.kv_lens[0]
             uniform_kv_lens = all(b_kv_len == kv_len for b_kv_len in self.kv_lens)
 
+            k_scale_bf16 = k_scale.to(torch.bfloat16)
+            v_scale_bf16 = v_scale.to(torch.bfloat16)
+
+            if self.cache_type == "paged":
+                block_table = tensor_mapping["block_table"]
+                kv_lens = tensor_mapping["kv_lens"]
+
+                if self.dtype in ("float8", "float8_e4m3"):
+                    _sycl_ext.dequant_kv_cache_fp8_paged(
+                        k_cache, v_cache,
+                        dequant_k_cache, dequant_v_cache,
+                        k_scale_bf16, v_scale_bf16,
+                        block_table, kv_lens,
+                        bs,
+                    )
+                else:
+                    _sycl_ext.dequant_kv_cache_paged(
+                        k_cache, v_cache,
+                        dequant_k_cache, dequant_v_cache,
+                        k_scale_bf16, v_scale_bf16,
+                        block_table, kv_lens,
+                        bs,
+                    )
+
+                return dequant_k_cache, dequant_v_cache
+
             if self.cache_type != "linear" or not uniform_kv_lens:
                 return super().dequant_kv_cache_run(tensor_mapping)
 
             if self.dtype in ("float8", "float8_e4m3"):
-                # FP8 dequant: scale as bf16 (matching torch's .to(bfloat16) truncation)
-                k_scale_bf16 = k_scale.to(torch.bfloat16)
-                v_scale_bf16 = v_scale.to(torch.bfloat16)
-
                 _sycl_ext.dequant_kv_cache_fp8(
                     k_cache, v_cache,
                     dequant_k_cache, dequant_v_cache,
@@ -75,10 +97,6 @@ try:
                     bs, kv_len
                 )
             else:
-                # INT8 dequant
-                k_scale_bf16 = k_scale.to(torch.bfloat16)
-                v_scale_bf16 = v_scale.to(torch.bfloat16)
-
                 _sycl_ext.dequant_kv_cache(
                     k_cache, v_cache,
                     dequant_k_cache, dequant_v_cache,
