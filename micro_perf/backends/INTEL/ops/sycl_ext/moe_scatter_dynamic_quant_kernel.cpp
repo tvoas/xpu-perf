@@ -71,6 +71,7 @@ void moe_scatter_dynamic_quant_impl(
     int n_expert = experts_token_count.size(0);
     int hd_size = hidden_states.size(1);
     int n_expert_total = n_expert;
+    constexpr int EXPERT_TILE = 8;
 
     constexpr float quant_max = QuantMax<T_out>::value;
 
@@ -142,112 +143,159 @@ void moe_scatter_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.depends_on(routing_event);
-            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens * topk, wg_size), sycl::range<2>(1, wg_size)),
+            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens, wg_size), sycl::range<2>(1, wg_size)),
             [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-
-                const int token_k_idx = item.get_group(0);
-                const int expert_id = selected_experts_ptr[token_k_idx];
-
-                if (expert_id < 0 || expert_id >= n_expert_total) {
-                    return;
-                }
-
                 // Increase SLM to handle OWORD block alignment: 1056B
                 slm_init(1056);
 
+                const int token_idx = item.get_group(0);
                 const int loc_id = item.get_local_id(1);
 
-                const int token_idx = token_k_idx / topk;
+                const int token_base = token_idx * topk;
 
-                const int offset = token_to_scatter_offset_ptr[token_k_idx];
-                const int expert_start = ext_tokens_start_ptr[expert_id];
+                for (int slot_base = 0; slot_base < topk; slot_base += EXPERT_TILE) {
+                    const int tile_slots = (topk - slot_base) < EXPERT_TILE ? (topk - slot_base) : EXPERT_TILE;
 
-                const int target_idx = expert_start + offset;
-                const float weight = moe_weights_ptr[token_k_idx];
+                    int expert_ids[EXPERT_TILE];
+                    int target_idxs[EXPERT_TILE];
+                    float weights[EXPERT_TILE];
+                    float thread_max[EXPERT_TILE];
+                    float token_scales[EXPERT_TILE];
 
-                simd<float, CHUNK> thread_max_vec = 0.0f;
-
-                // Pass 1 (Removed Cache Hints)
-                for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
-#pragma unroll
-                    for (int u = 0; u < UNROLL; ++u) {
-                        simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
-                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
-                        simd<float, CHUNK> scale = block_load<float, CHUNK>(
-                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
-
-                        simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
-                        simd<float, CHUNK> smoothed_abs = sycl::ext::intel::esimd::abs(smoothed);
-
-                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, smoothed_abs);
-                    }
-                }
-
-                float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
-
-                // Use SLM Block Stores array spacing for max bandwidth (16-byte aligned natively)
-                slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max));
-                barrier();
-
-                float this_token_scale = 1.0f;
-
-                if (loc_id == 0) {
-                    float max_value_final = 0.0f;
-
-                    for (int i = 0; i < wg_size; i++) {
-                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
-                        if (val[0] > max_value_final) max_value_final = val[0];
+                    for (int slot = 0; slot < EXPERT_TILE; ++slot) {
+                        expert_ids[slot] = -1;
+                        target_idxs[slot] = 0;
+                        weights[slot] = 0.0f;
+                        thread_max[slot] = 0.0f;
+                        token_scales[slot] = 1.0f;
                     }
 
-                    float raw_token_scale = max_value_final / quant_max;
-                    this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
-
-                    slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
-                }
-                barrier();
-
-                this_token_scale = slm_block_load<float, 4>(1024)[0];
-                float recip_scale = 1.0f / this_token_scale;
-
-                // Pass 2 (Removed Cache Hints)
-                for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
-#pragma unroll
-                    for (int u = 0; u < UNROLL; ++u) {
-                        simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
-                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
-                        simd<float, CHUNK> scale = block_load<float, CHUNK>(
-                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
-
-                        simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
-
-                        simd<T_out, CHUNK> quantized;
-                        if constexpr (std::is_same_v<T_out, int8_t>) {
-                            quantized = rnde<float>(smoothed * recip_scale);
-                        } else {
-                            quantized = fast_cvt_float_to_e4m3fn<CHUNK>(smoothed * recip_scale);
+                    for (int slot = 0; slot < tile_slots; ++slot) {
+                        const int global_slot = token_base + slot_base + slot;
+                        const int expert_id = selected_experts_ptr[global_slot];
+                        if (expert_id < 0 || expert_id >= n_expert_total) {
+                            continue;
                         }
 
-                        block_store<T_out, CHUNK>(
-                            scatter_tokens_ptr + target_idx * hd_size + hd_bid * BS + u * CHUNK, quantized);
-                    }
-                }
+                        expert_ids[slot] = expert_id;
+                        weights[slot] = moe_weights_ptr[global_slot];
 
-                if (loc_id == 0) {
-                    block_store<float, 1>(scatter_per_token_scale_ptr + target_idx, this_token_scale);
-                    block_store<int32_t, 1>(scatter_tokens_offset_ptr + target_idx, token_idx);
+                        const int offset = token_to_scatter_offset_ptr[global_slot];
+                        const int expert_start = ext_tokens_start_ptr[expert_id];
+                        target_idxs[slot] = expert_start + offset;
+                    }
+
+                    // Pass 1: load each hidden-state chunk once and accumulate maxima for this expert tile.
+                    for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
+#pragma unroll
+                        for (int u = 0; u < UNROLL; ++u) {
+                            simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
+                                hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
+                            simd<float, CHUNK> hidden_fp = simd<float, CHUNK>(hidden);
+
+                            for (int slot = 0; slot < tile_slots; ++slot) {
+                                const int expert_id = expert_ids[slot];
+                                if (expert_id < 0) {
+                                    continue;
+                                }
+
+                                simd<float, CHUNK> scale = block_load<float, CHUNK>(
+                                    smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
+
+                                simd<float, CHUNK> smoothed = hidden_fp * scale * weights[slot];
+                                float chunk_max = hmax<float, float, CHUNK>(
+                                    sycl::ext::intel::esimd::abs(smoothed));
+
+                                if (chunk_max > thread_max[slot]) {
+                                    thread_max[slot] = chunk_max;
+                                }
+                            }
+                        }
+                    }
+
+                    for (int slot = 0; slot < tile_slots; ++slot) {
+                        if (expert_ids[slot] < 0) {
+                            continue;
+                        }
+
+                        // Use SLM Block Stores array spacing for max bandwidth (16-byte aligned natively)
+                        slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max[slot]));
+                        barrier();
+
+                        if (loc_id == 0) {
+                            float max_value_final = 0.0f;
+
+                            for (int i = 0; i < wg_size; i++) {
+                                simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                                if (val[0] > max_value_final) max_value_final = val[0];
+                            }
+
+                            float raw_token_scale = max_value_final / quant_max;
+                            float this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
+
+                            slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
+                        }
+                        barrier();
+
+                        token_scales[slot] = slm_block_load<float, 4>(1024)[0];
+                        barrier();
+                    }
+
+                    // Pass 2: reuse each hidden-state chunk across the same expert tile for quantization.
+                    for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
+#pragma unroll
+                        for (int u = 0; u < UNROLL; ++u) {
+                            simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
+                                hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
+                            simd<float, CHUNK> hidden_fp = simd<float, CHUNK>(hidden);
+
+                            for (int slot = 0; slot < tile_slots; ++slot) {
+                                const int expert_id = expert_ids[slot];
+                                if (expert_id < 0) {
+                                    continue;
+                                }
+
+                                simd<float, CHUNK> scale = block_load<float, CHUNK>(
+                                    smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
+                                simd<float, CHUNK> smoothed = hidden_fp * scale * weights[slot];
+                                float recip_scale = 1.0f / token_scales[slot];
+
+                                simd<T_out, CHUNK> quantized;
+                                if constexpr (std::is_same_v<T_out, int8_t>) {
+                                    quantized = rnde<float>(smoothed * recip_scale);
+                                } else {
+                                    quantized = fast_cvt_float_to_e4m3fn<CHUNK>(smoothed * recip_scale);
+                                }
+
+                                block_store<T_out, CHUNK>(
+                                    scatter_tokens_ptr + target_idxs[slot] * hd_size + hd_bid * BS + u * CHUNK, quantized);
+                            }
+                        }
+                    }
+
+                    if (loc_id == 0) {
+                        for (int slot = 0; slot < tile_slots; ++slot) {
+                            if (expert_ids[slot] < 0) {
+                                continue;
+                            }
+
+                            block_store<float, 1>(scatter_per_token_scale_ptr + target_idxs[slot], token_scales[slot]);
+                            block_store<int32_t, 1>(scatter_tokens_offset_ptr + target_idxs[slot], token_idx);
+                        }
+                    }
                 }
             });
         });
     };
 
-    int total_scatter_items = n_tokens * topk;
+    int total_token_groups = n_tokens;
 
     int target_total_threads = 1024;
 
     auto is_valid_unroll = [&](int unroll) {
         int bs = unroll * 64;
         int max_wg_size = std::min(hd_size / bs, 64);
-        return (hd_size % bs == 0) && ((total_scatter_items * max_wg_size) >= target_total_threads);
+        return (hd_size % bs == 0) && ((total_token_groups * max_wg_size) >= target_total_threads);
     };
 
     if (is_valid_unroll(32)) return launch_scatter(std::integral_constant<int, 32>{});
