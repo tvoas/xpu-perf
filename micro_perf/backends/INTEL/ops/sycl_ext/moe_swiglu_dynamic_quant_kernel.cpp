@@ -63,6 +63,8 @@ void moe_swiglu_dynamic_quant_impl(
 
     auto scatter_tokens_ptr = reinterpret_cast<T_in*>(scatter_tokens.data_ptr());
     auto smooth_scale_ptr = smooth_scale.data_ptr<float>();
+    auto experts_token_count_ptr = experts_token_count.data_ptr<int32_t>();
+    auto experts_token_start_ptr = experts_token_start.data_ptr<int32_t>();
     auto scatter_expert_ids_ptr = scatter_expert_ids.data_ptr<int32_t>();
     auto quant_tokens_ptr = reinterpret_cast<T_out*>(quant_tokens.data_ptr());
     auto per_token_scale_ptr = per_token_scale.data_ptr<float>();
@@ -178,6 +180,77 @@ void moe_swiglu_dynamic_quant_impl(
     auto dispatch_slm = [&](auto unroll_tag) {
         return launch_swiglu(unroll_tag);
     };
+
+    if constexpr (std::is_same_v<T_in, bf16> && std::is_same_v<T_out, int8_t>) {
+        if (hidden_size % 256 == 0 && hidden_size <= 8192) {
+            constexpr int FAST_BS = 256;
+            constexpr int FAST_MAX_BN = 32;
+
+            int num_blocks = hidden_size / FAST_BS;
+
+            sycl::range<3> GlobalRange(total_experts_num, max_token_num, num_blocks);
+            sycl::range<3> LocalRange(1, 1, num_blocks);
+
+            queue.submit([&](sycl::handler& cgh) {
+                cgh.parallel_for(sycl::nd_range<3>(GlobalRange, LocalRange),
+                [=](sycl::nd_item<3> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
+                    slm_init(FAST_MAX_BN * sizeof(float));
+
+                    const int expert_idx = item.get_global_id(0);
+                    const int token_idx = item.get_global_id(1);
+                    const int bid = item.get_local_id(2);
+
+                    const int token_cnt = experts_token_count_ptr[expert_idx];
+                    if (token_idx >= token_cnt) {
+                        return;
+                    }
+
+                    const int token_start = experts_token_start_ptr[expert_idx];
+                    const int flat_idx = token_start + token_idx;
+
+                    bf16* scatter_token_base = scatter_tokens_ptr + flat_idx * 2 * hidden_size;
+                    int8_t* output_base = quant_tokens_ptr + flat_idx * hidden_size + bid * FAST_BS;
+
+                    simd<bf16, FAST_BS> x1 = block_load<bf16, FAST_BS>(scatter_token_base + bid * FAST_BS);
+                    simd<bf16, FAST_BS> x2 = block_load<bf16, FAST_BS>(scatter_token_base + hidden_size + bid * FAST_BS);
+                    simd<float, FAST_BS> scale = block_load<float, FAST_BS>(
+                        smooth_scale_ptr + expert_idx * hidden_size + bid * FAST_BS);
+
+                    simd<float, FAST_BS> x1_fp = simd<float, FAST_BS>(x1);
+                    simd<float, FAST_BS> sigmoid = sycl::ext::intel::esimd::inv(
+                        1.0f + sycl::ext::intel::esimd::exp(-x1_fp));
+                    simd<float, FAST_BS> scaled_swiglu_tokens =
+                        (x1_fp * sigmoid) * simd<float, FAST_BS>(x2) * scale;
+
+                    float max_value = hmax<float, float, FAST_BS>(
+                        sycl::ext::intel::esimd::abs(scaled_swiglu_tokens));
+                    slm_block_store<float, 1>(bid * sizeof(float), simd<float, 1>(max_value));
+
+                    if (bid == 0) {
+                        for (int i = num_blocks; i < FAST_MAX_BN; ++i) {
+                            slm_block_store<float, 1>(i * sizeof(float), simd<float, 1>(0.0f));
+                        }
+                    }
+                    barrier();
+
+                    simd<float, FAST_MAX_BN> max_value_full = slm_block_load<float, FAST_MAX_BN>(0);
+                    float max_value_final = hmax<float, float, FAST_MAX_BN>(max_value_full);
+                    float raw_token_scale = max_value_final / quant_max;
+                    float this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
+
+                    simd<int8_t, FAST_BS> quantized_out =
+                        rnde<float>(scaled_swiglu_tokens * (1.0f / this_token_scale));
+                    block_store<int8_t, FAST_BS>(output_base, quantized_out);
+
+                    if (bid == 0) {
+                        block_store<float, 1>(per_token_scale_ptr + flat_idx, this_token_scale);
+                    }
+                });
+            });
+
+            return;
+        }
+    }
 
     int target_wg = 2;
 
