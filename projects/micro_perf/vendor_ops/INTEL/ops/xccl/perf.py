@@ -60,6 +60,9 @@ def run_perf(backend, op_instance):
     kernel_mapping = {}
 
     try:
+        min_test_iters = 2
+        max_test_iters = 10
+        max_test_time = 5e4     # 50 ms
         # --- iter / data-cnt caps ---
         min_iters = 3 if _should_throttle(op_instance) else 10
         max_data_cnt = 1
@@ -83,7 +86,10 @@ def run_perf(backend, op_instance):
 
         # Probe latency
         latency_us, _ = backend.core_perf(op_instance, 2, 2, tensor_list, profiling=False)
-        prefer_iters = min(max(int(1e6 / latency_us), 2), min_iters)
+        if latency_us >= max_test_time:
+            prefer_iters = min_test_iters
+        else:
+            prefer_iters = min(max(math.ceil(max_test_time / latency_us), min_test_iters), max_test_iters)
         if op_instance.group_size > 1:
             dist = backend.get_dist_module()
             buf = [None] * op_instance.group_size
