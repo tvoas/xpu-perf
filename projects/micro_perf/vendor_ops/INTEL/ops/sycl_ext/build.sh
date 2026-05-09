@@ -45,7 +45,36 @@ SYCL_TLA_RUNTIME_PATHS=(-Wl,-rpath,/lib64/stubs -Wl,-rpath,"$MKLROOT/lib" -Wl,-r
 BMG_09_LINK_FLAGS=(-Xs "-options \"-igc_opts 'VectorAliasBBThreshold=10000'\"")
 BMG_10_LINK_FLAGS=(-Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
 
-echo "Building store_kv_cache SYCL extension..."
+# Auto-detect BMG device target: bmg-g21 (B580/B570) or bmg-g31 (B770/B740)
+# Override with: BMG_DEVICE=bmg-g21 bash build.sh
+if [[ -z "${BMG_DEVICE:-}" ]]; then
+    # 0xe20b/0xe20c = B580/B570 (G21), 0xe223/0xe202 = B770/B740 (G31)
+    PCI_ID=$(xpu-smi discovery 2>/dev/null | grep -oP 'Device Name:.*\[\K0x[0-9a-fA-F]+' | head -1 || true)
+    case "$PCI_ID" in
+        0xe20b|0xe20c) BMG_DEVICE="bmg-g21" ;;
+        0xe223|0xe202) BMG_DEVICE="bmg-g31" ;;
+        *)             BMG_DEVICE="bmg-g31"; echo "WARNING: Unknown PCI ID '$PCI_ID', defaulting to $BMG_DEVICE" ;;
+    esac
+fi
+echo "Target device: $BMG_DEVICE"
+
+# Parallel build infrastructure
+LOG_DIR=$(mktemp -d)
+PIDS=()
+NAMES=()
+FAIL=0
+
+build_async() {
+    local name="$1"; shift
+    echo "  Starting: $name"
+    "$@" > "$LOG_DIR/$name.log" 2>&1 &
+    PIDS+=($!)
+    NAMES+=("$name")
+}
+
+# --- Simple SYCL extensions (no sycl-tla) ---
+
+build_async store_kv_cache_sycl \
 icpx -fsycl -shared -fPIC -O2 -std=c++17 \
     -DTORCH_EXTENSION_NAME=store_kv_cache_sycl \
     $TORCH_INCLUDES \
@@ -55,11 +84,7 @@ icpx -fsycl -shared -fPIC -O2 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10
 
-echo "Built: $SCRIPT_DIR/store_kv_cache_sycl.so"
-ls -la store_kv_cache_sycl.so
-
-echo ""
-echo "Building dequant_kv_cache SYCL extension..."
+build_async dequant_kv_cache_sycl \
 icpx -fsycl -shared -fPIC -O2 -std=c++17 \
     -DTORCH_EXTENSION_NAME=dequant_kv_cache_sycl \
     $TORCH_INCLUDES \
@@ -69,11 +94,7 @@ icpx -fsycl -shared -fPIC -O2 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10
 
-echo "Built: $SCRIPT_DIR/dequant_kv_cache_sycl.so"
-ls -la dequant_kv_cache_sycl.so
-
-echo ""
-echo "Building reduce_min SYCL extension..."
+build_async reduce_min_sycl \
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=reduce_min_sycl \
     $TORCH_INCLUDES \
@@ -83,11 +104,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
-echo "Built: $SCRIPT_DIR/reduce_min_sycl.so"
-ls -la reduce_min_sycl.so
-
-echo ""
-echo "Building reduce_max SYCL extension..."
+build_async reduce_max_sycl \
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=reduce_max_sycl \
     $TORCH_INCLUDES \
@@ -97,19 +114,17 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
-echo "Built: $SCRIPT_DIR/reduce_max_sycl.so"
-ls -la reduce_max_sycl.so
+build_async softmax_sycl \
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=softmax_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    softmax_kernel.cpp \
+    -o softmax_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
 
-
-echo ""
-echo "Building softmax SYCL extension..."
-icpx -fsycl -shared -fPIC -O3 -std=c++17     -DTORCH_EXTENSION_NAME=softmax_sycl     $TORCH_INCLUDES     -I"$PYTHON_INCLUDE"     softmax_kernel.cpp     -o softmax_sycl.so     $TORCH_LIBS     -ltorch -ltorch_python -lc10 -lc10_xpu
-
-echo "Built: $SCRIPT_DIR/softmax_sycl.so"
-ls -la softmax_sycl.so
-
-echo ""
-echo "Building moe_softmax_topk SYCL extension..."
+build_async moe_softmax_topk_sycl \
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=moe_softmax_topk_sycl \
     $TORCH_INCLUDES \
@@ -119,11 +134,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
-echo "Built: $SCRIPT_DIR/moe_softmax_topk_sycl.so"
-ls -la moe_softmax_topk_sycl.so
-
-echo ""
-echo "Building scatter SYCL extension..."
+build_async scatter_sycl \
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=scatter_sycl \
     $TORCH_INCLUDES \
@@ -133,11 +144,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
-echo "Built: $SCRIPT_DIR/scatter_sycl.so"
-ls -la scatter_sycl.so
-
-echo ""
-echo "Building head_rms_norm SYCL extension..."
+build_async head_rms_norm_sycl \
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=head_rms_norm_sycl \
     $TORCH_INCLUDES \
@@ -147,11 +154,7 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
-echo "Built: $SCRIPT_DIR/head_rms_norm_sycl.so"
-ls -la head_rms_norm_sycl.so
-
-echo ""
-echo "Building scale_dynamic_quant SYCL extension..."
+build_async scale_dynamic_quant_sycl \
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=scale_dynamic_quant_sycl \
     $TORCH_INCLUDES \
@@ -161,10 +164,9 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
-echo "Built: $SCRIPT_DIR/scale_dynamic_quant_sycl.so"
-ls -la scale_dynamic_quant_sycl.so
+# --- SYCL-TLA extensions (AOT for BMG) ---
 
-echo "Building bmg_moe_gating_gemm_sycl SYCL extension..."
+build_async bmg_moe_gating_gemm_sycl \
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=bmg_moe_gating_gemm_sycl \
     $SYCL_TLA_COMPILE_FLAGS \
@@ -173,7 +175,7 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_INCLUDES \
     00_bmg_moe_gating_gemm.cpp \
     $SYCL_TLA_LINK_FLAGS \
-    -Xsycl-target-backend=spir64_gen "-device bmg-g21" \
+    -Xsycl-target-backend=spir64_gen "-device $BMG_DEVICE" \
     -Xspirv-translator \
     -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
     "${SYCL_TLA_RUNTIME_PATHS[@]}" \
@@ -182,11 +184,7 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_LINK_LIBS \
     $TORCH_LIBS -ltorch -ltorch_python -lc10
 
-echo "Built: $SCRIPT_DIR/bmg_moe_gating_gemm_sycl.so"
-ls -la bmg_moe_gating_gemm_sycl.so
-
-echo ""
-echo "Building bmg_moe_quant_grouped_gemm_fp8_sycl SYCL extension..."
+build_async bmg_moe_quant_grouped_gemm_fp8_sycl \
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=bmg_moe_quant_grouped_gemm_fp8_sycl \
     $SYCL_TLA_COMPILE_FLAGS \
@@ -195,7 +193,7 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_INCLUDES \
     09_bmg_moe_quant_grouped_gemm.cpp \
     $SYCL_TLA_LINK_FLAGS \
-    -Xsycl-target-backend=spir64_gen "-device bmg-g21" \
+    -Xsycl-target-backend=spir64_gen "-device $BMG_DEVICE" \
     "${BMG_09_LINK_FLAGS[@]}" \
     -Xspirv-translator \
     -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
@@ -205,11 +203,7 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_LINK_LIBS \
     $TORCH_LIBS -ltorch -ltorch_python -lc10
 
-echo "Built: $SCRIPT_DIR/bmg_moe_quant_grouped_gemm_fp8_sycl.so"
-ls -la bmg_moe_quant_grouped_gemm_fp8_sycl.so
-
-echo ""
-echo "Building bmg_moe_quant_grouped_gemm_int8_sycl SYCL extension..."
+build_async bmg_moe_quant_grouped_gemm_int8_sycl \
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=bmg_moe_quant_grouped_gemm_int8_sycl \
     $SYCL_TLA_COMPILE_FLAGS \
@@ -218,7 +212,7 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_INCLUDES \
     10_bmg_moe_quant_grouped_gemm.cpp \
     $SYCL_TLA_LINK_FLAGS \
-    -Xsycl-target-backend=spir64_gen "-device bmg-g21" \
+    -Xsycl-target-backend=spir64_gen "-device $BMG_DEVICE" \
     "${BMG_10_LINK_FLAGS[@]}" \
     -Xspirv-translator \
     -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
@@ -228,11 +222,7 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_LINK_LIBS \
     $TORCH_LIBS -ltorch -ltorch_python -lc10
 
-echo "Built: $SCRIPT_DIR/bmg_moe_quant_grouped_gemm_int8_sycl.so"
-ls -la bmg_moe_quant_grouped_gemm_int8_sycl.so
-
-echo ""
-echo "Building quant_matmul_sycl SYCL extension..."
+build_async quant_matmul_sycl \
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=quant_matmul_sycl \
     $SYCL_TLA_COMPILE_FLAGS \
@@ -241,7 +231,7 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_INCLUDES \
     quant_matmul.cpp \
     $SYCL_TLA_LINK_FLAGS \
-    -Xsycl-target-backend=spir64_gen "-device bmg-g21" \
+    -Xsycl-target-backend=spir64_gen "-device $BMG_DEVICE" \
     -Xspirv-translator \
     -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
     "${SYCL_TLA_RUNTIME_PATHS[@]}" \
@@ -249,5 +239,25 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -o quant_matmul_sycl.so \
     $SYCL_TLA_LINK_LIBS
 
-echo "Built: $SCRIPT_DIR/quant_matmul_sycl.so"
-ls -la quant_matmul_sycl.so
+# --- Wait for all builds ---
+echo ""
+echo "Waiting for ${#PIDS[@]} parallel builds..."
+for i in "${!PIDS[@]}"; do
+    if wait "${PIDS[$i]}"; then
+        echo "  OK: ${NAMES[$i]}"
+    else
+        echo "  FAILED: ${NAMES[$i]} (see $LOG_DIR/${NAMES[$i]}.log)"
+        FAIL=1
+    fi
+done
+
+if [[ $FAIL -ne 0 ]]; then
+    echo ""
+    echo "Some builds failed. Logs in: $LOG_DIR"
+    exit 1
+fi
+rm -rf "$LOG_DIR"
+
+echo ""
+echo "All builds successful:"
+ls -la "$SCRIPT_DIR"/*.so

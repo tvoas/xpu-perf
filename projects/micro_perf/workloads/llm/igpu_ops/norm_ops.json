@@ -23,7 +23,7 @@
         {
             "arg_type": "llm",
             "dtype": "bfloat16",
-            "dst_dtype": "int8",
+            "dst_dtype": ["int8", "float8"],
             "num_tokens": [40, 80, 4096],
             "head_num": [128],
             "head_dim": [96, 8]
@@ -41,10 +41,10 @@
     "add_rms_norm_dynamic_quant": [
         {
             "arg_type": "llm",
-            "dtype": "float16",
-            "dst_dtype": "int8",
+            "dtype": "bfloat16",
+            "dst_dtype": ["int8", "float8"],
             "add_residual": [true, false],
-            "hidden_size": [7168],
+            "hidden_size": [4096, 5120, 7168],
             "num_tokens": [40, 80, 4096]
         }
     ],
@@ -52,18 +52,18 @@
         {
             "arg_type": "llm",
             "dtype": "bfloat16",
-            "dst_dtype": "int8",
-            "hidden_size": [7168, 10240, 16384],
-            "num_tokens": [4096, 40, 80]
+            "dst_dtype": ["int8", "float8"],
+            "hidden_size": [1024, 4096, 7168],
+            "num_tokens": [40, 80, 4096]
         }
     ],
     "swiglu_dynamic_quant": [
         {
             "arg_type": "llm",
             "dtype": "bfloat16",
-            "dst_dtype": "int8",
-            "hidden_size": [7168, 10240, 16384],
-            "num_tokens": [4096, 40, 80]
+            "dst_dtype": ["int8", "float8"],
+            "hidden_size": [3200, 7168],
+            "num_tokens": [40, 80, 4096]
         }
     ]
 }

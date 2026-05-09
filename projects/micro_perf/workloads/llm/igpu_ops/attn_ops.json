@@ -1,38 +1,4 @@
 {
-    "rotary_embedding": [
-        {
-            "arg_type": "llm",
-            "dtype": "bfloat16",
-            "mode": "prefill",
-            "q_head_num.kv_head_num.head_dim": [
-                [96, 8, 128]
-            ],
-            "rope_offset.rope_dim": [
-                [0, 128],
-                [80, 48],
-                [80, 16]
-            ],
-            "batch_size": [1],
-            "cache_len": [100],
-            "q_len": [4096]
-        },
-        {
-            "arg_type": "llm",
-            "dtype": "bfloat16",
-            "mode": "decode",
-            "q_head_num.kv_head_num.head_dim": [
-                [96, 8, 128]
-            ],
-            "rope_offset.rope_dim": [
-                [0, 128],
-                [80, 48],
-                [80, 16]
-            ],
-            "batch_size": [10, 20],
-            "cache_len": [105],
-            "q_len": [4]
-        }
-    ],
     "dequant_kv_cache": [
         {
             "arg_type": "llm",
@@ -69,34 +35,39 @@
             "block_size": [0]
         }
     ],
-    "store_paged_kv_cache": [
+    "store_kv_cache": [
         {
             "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
-            "block_size": [512],
-            "total_block_num": [1024],
-            "mode": "decode",
-            "q_head_num.kv_head_num.head_dim": [
-                [96, 8, 128]
+            "attn_mode": "prefill",
+            "dtype.cache_dtype": [
+                ["bfloat16", "float8"]
             ],
-            "batch_size": [10, 20],
-            "cache_len": [512],
-            "q_seq_len": [4]
+            "store_mode": ["both", "k"],
+            "q_head_num.kv_head_num.head_dim": [
+                [80, 8, 128]
+            ],
+            "block_size": 512,
+            "batch_size.cache_len.q_len": [
+                [1, 0, 10240],
+                [1, 5120, 5120],
+                [1, 0, 32768]
+            ]
         },
         {
             "arg_type": "llm",
-            "dtype": "bfloat16",
-            "dst_dtype": "int8",
-            "block_size": [512],
-            "total_block_num": [1024],
-            "mode": "prefill",
-            "q_head_num.kv_head_num.head_dim": [
-                [96, 8, 128]
+            "attn_mode": "decode",
+            "dtype.cache_dtype": [
+                ["bfloat16", "float8"]
             ],
-            "batch_size": [1],
-            "cache_len": [512],
-            "q_seq_len": [4096]
+            "store_mode": ["both", "k"],
+            "q_head_num.kv_head_num.head_dim": [
+                [80, 8, 128]
+            ],
+            "block_size": 512,
+            "batch_size.cache_len.q_len": [
+                [16, 10240, 1],
+                [16, 10240, 4]
+            ]
         }
     ],
     "sage_attention_page": [
