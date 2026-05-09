@@ -230,3 +230,24 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
 
 echo "Built: $SCRIPT_DIR/bmg_moe_quant_grouped_gemm_int8_sycl.so"
 ls -la bmg_moe_quant_grouped_gemm_int8_sycl.so
+
+echo ""
+echo "Building quant_matmul_sycl SYCL extension..."
+icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
+    -DTORCH_EXTENSION_NAME=quant_matmul_sycl \
+    $SYCL_TLA_COMPILE_FLAGS \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    $SYCL_TLA_INCLUDES \
+    quant_matmul.cpp \
+    $SYCL_TLA_LINK_FLAGS \
+    -Xsycl-target-backend=spir64_gen "-device bmg-g21" \
+    -Xspirv-translator \
+    -spirv-ext=+SPV_INTEL_split_barrier,+SPV_INTEL_2d_block_io,+SPV_INTEL_subgroup_matrix_multiply_accumulate \
+    "${SYCL_TLA_RUNTIME_PATHS[@]}" \
+    -L/lib64/stubs \
+    -o quant_matmul_sycl.so \
+    $SYCL_TLA_LINK_LIBS
+
+echo "Built: $SCRIPT_DIR/quant_matmul_sycl.so"
+ls -la quant_matmul_sycl.so

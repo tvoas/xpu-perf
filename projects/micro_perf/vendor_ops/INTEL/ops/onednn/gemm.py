@@ -183,6 +183,15 @@ try:
                 "--mode=P",
                 "--cold-cache=all",
                 f"--dt={dt_arg}",
+                # Force plain row-major (ab) for src/wei/dst, matching how
+                # IPEX-XPU constructs memory::desc from PyTorch tensor strides
+                # (using_onednn_layout_for_matmul() returns false since IPEX 2.5).
+                # Without this, benchdnn defaults to format_tag::any and oneDNN
+                # may pick a padded/blocked layout that does not reflect the
+                # real torch.matmul perf path.
+                "--stag=ab",
+                "--wtag=ab",
+                "--dtag=ab",
                 f"--perf-template={perf_tpl}",
                 prb,
             ]
