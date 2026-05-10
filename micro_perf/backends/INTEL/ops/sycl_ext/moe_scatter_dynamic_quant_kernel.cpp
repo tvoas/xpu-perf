@@ -132,8 +132,113 @@ void moe_scatter_dynamic_quant_impl(
     auto scatter_per_token_scale_ptr = scatter_per_token_scale.data_ptr<float>();
     auto scatter_tokens_offset_ptr = scatter_tokens_offset.data_ptr<int32_t>();
 
-    // Pass 3: Gather, quantize, and scatter
-    auto launch_scatter = [&](auto unroll_tag) {
+    // Legacy per-token-expert scatter path keeps stronger mean throughput once work scales.
+    auto launch_scatter_legacy = [&](auto unroll_tag) {
+        constexpr int UNROLL = decltype(unroll_tag)::value;
+        constexpr int CHUNK = 64;
+        constexpr int BS = CHUNK * UNROLL;
+
+        int num_blocks = hd_size / BS;
+        int wg_size = std::min(num_blocks, 64);
+
+        queue.submit([&](sycl::handler& cgh) {
+            cgh.depends_on(routing_event);
+            cgh.parallel_for(sycl::nd_range<2>(sycl::range<2>(n_tokens * topk, wg_size), sycl::range<2>(1, wg_size)),
+            [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
+
+                const int token_k_idx = item.get_group(0);
+                const int expert_id = selected_experts_ptr[token_k_idx];
+
+                if (expert_id < 0 || expert_id >= n_expert_total) {
+                    return;
+                }
+
+                slm_init(1056);
+
+                const int loc_id = item.get_local_id(1);
+
+                const int token_idx = token_k_idx / topk;
+
+                const int offset = token_to_scatter_offset_ptr[token_k_idx];
+                const int expert_start = ext_tokens_start_ptr[expert_id];
+
+                const int target_idx = expert_start + offset;
+                const float weight = moe_weights_ptr[token_k_idx];
+
+                simd<float, CHUNK> thread_max_vec = 0.0f;
+
+                for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
+#pragma unroll
+                    for (int u = 0; u < UNROLL; ++u) {
+                        simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
+                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
+                        simd<float, CHUNK> scale = block_load<float, CHUNK>(
+                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
+
+                        simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
+                        simd<float, CHUNK> smoothed_abs = sycl::ext::intel::esimd::abs(smoothed);
+
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, smoothed_abs);
+                    }
+                }
+
+                float thread_max = hmax<float, float, CHUNK>(thread_max_vec);
+
+                slm_block_store<float, 4>(loc_id * 16, simd<float, 4>(thread_max));
+                barrier();
+
+                float this_token_scale = 1.0f;
+
+                if (loc_id == 0) {
+                    float max_value_final = 0.0f;
+
+                    for (int i = 0; i < wg_size; i++) {
+                        simd<float, 4> val = slm_block_load<float, 4>(i * 16);
+                        if (val[0] > max_value_final) max_value_final = val[0];
+                    }
+
+                    float raw_token_scale = max_value_final / quant_max;
+                    this_token_scale = raw_token_scale == 0.0f ? 1.0f : raw_token_scale;
+
+                    slm_block_store<float, 4>(1024, simd<float, 4>(this_token_scale));
+                }
+                barrier();
+
+                this_token_scale = slm_block_load<float, 4>(1024)[0];
+                float recip_scale = 1.0f / this_token_scale;
+
+                for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
+#pragma unroll
+                    for (int u = 0; u < UNROLL; ++u) {
+                        simd<T_in, CHUNK> hidden = block_load<T_in, CHUNK>(
+                            hidden_states_ptr + token_idx * hd_size + hd_bid * BS + u * CHUNK);
+                        simd<float, CHUNK> scale = block_load<float, CHUNK>(
+                            smooth_scale_ptr + expert_id * hd_size + hd_bid * BS + u * CHUNK);
+
+                        simd<float, CHUNK> smoothed = simd<float, CHUNK>(hidden) * scale * weight;
+
+                        simd<T_out, CHUNK> quantized;
+                        if constexpr (std::is_same_v<T_out, int8_t>) {
+                            quantized = rnde<float>(smoothed * recip_scale);
+                        } else {
+                            quantized = fast_cvt_float_to_e4m3fn<CHUNK>(smoothed * recip_scale);
+                        }
+
+                        block_store<T_out, CHUNK>(
+                            scatter_tokens_ptr + target_idx * hd_size + hd_bid * BS + u * CHUNK, quantized);
+                    }
+                }
+
+                if (loc_id == 0) {
+                    block_store<float, 1>(scatter_per_token_scale_ptr + target_idx, this_token_scale);
+                    block_store<int32_t, 1>(scatter_tokens_offset_ptr + target_idx, token_idx);
+                }
+            });
+        });
+    };
+
+    // Grouped per-token scatter path improves some underfilled shapes by reusing hidden loads across experts.
+    auto launch_scatter_grouped = [&](auto unroll_tag) {
         constexpr int UNROLL = decltype(unroll_tag)::value;
         constexpr int CHUNK = 64;
         constexpr int BS = CHUNK * UNROLL;
@@ -288,22 +393,47 @@ void moe_scatter_dynamic_quant_impl(
         });
     };
 
+    int total_scatter_items = n_tokens * topk;
     int total_token_groups = n_tokens;
 
     int target_total_threads = 1024;
 
-    auto is_valid_unroll = [&](int unroll) {
+    auto is_valid_unroll_legacy = [&](int unroll) {
+        int bs = unroll * 64;
+        int max_wg_size = std::min(hd_size / bs, 64);
+        return (hd_size % bs == 0) && ((total_scatter_items * max_wg_size) >= target_total_threads);
+    };
+
+    auto is_valid_unroll_grouped = [&](int unroll) {
         int bs = unroll * 64;
         int max_wg_size = std::min(hd_size / bs, 64);
         return (hd_size % bs == 0) && ((total_token_groups * max_wg_size) >= target_total_threads);
     };
 
-    if (is_valid_unroll(32)) return launch_scatter(std::integral_constant<int, 32>{});
-    if (is_valid_unroll(16)) return launch_scatter(std::integral_constant<int, 16>{});
-    if (is_valid_unroll(8))  return launch_scatter(std::integral_constant<int, 8>{});
-    if (is_valid_unroll(4))  return launch_scatter(std::integral_constant<int, 4>{});
-    if (is_valid_unroll(2))  return launch_scatter(std::integral_constant<int, 2>{});
-                             return launch_scatter(std::integral_constant<int, 1>{});
+    // V06/V07 data shows the grouped path helps underfilled regimes, while the legacy path
+    // retains better mean throughput once token count, top-k, or hidden size grows.
+    bool prefer_grouped =
+        (hd_size <= 512 && n_tokens <= 512) ||
+        (hd_size <= 2048 && n_expert_total <= 128 &&
+            ((topk <= 2 && n_tokens <= 1024) ||
+             (topk <= 5 && n_tokens <= 512) ||
+             (topk > 5 && n_tokens <= 128)));
+
+    if (prefer_grouped) {
+        if (is_valid_unroll_grouped(32)) return launch_scatter_grouped(std::integral_constant<int, 32>{});
+        if (is_valid_unroll_grouped(16)) return launch_scatter_grouped(std::integral_constant<int, 16>{});
+        if (is_valid_unroll_grouped(8))  return launch_scatter_grouped(std::integral_constant<int, 8>{});
+        if (is_valid_unroll_grouped(4))  return launch_scatter_grouped(std::integral_constant<int, 4>{});
+        if (is_valid_unroll_grouped(2))  return launch_scatter_grouped(std::integral_constant<int, 2>{});
+                                        return launch_scatter_grouped(std::integral_constant<int, 1>{});
+    }
+
+    if (is_valid_unroll_legacy(32)) return launch_scatter_legacy(std::integral_constant<int, 32>{});
+    if (is_valid_unroll_legacy(16)) return launch_scatter_legacy(std::integral_constant<int, 16>{});
+    if (is_valid_unroll_legacy(8))  return launch_scatter_legacy(std::integral_constant<int, 8>{});
+    if (is_valid_unroll_legacy(4))  return launch_scatter_legacy(std::integral_constant<int, 4>{});
+    if (is_valid_unroll_legacy(2))  return launch_scatter_legacy(std::integral_constant<int, 2>{});
+                                    return launch_scatter_legacy(std::integral_constant<int, 1>{});
 }
 
 // Outer dispatch macros to select implementation
