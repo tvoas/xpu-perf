@@ -98,7 +98,6 @@ class MoeQuantGroupGemmCombineOp(BasicOp):
             shape=[self.dispatch_tokens, self.hidden_size], 
             dtype=self.torch_dtype, 
             device=self.backend.get_torch_device_name(),
-            creator=torch.zeros
         )
         self.input_tensor_info["per_token_scale"] = OpTensorInfo(
             shape=[self.dispatch_tokens], 

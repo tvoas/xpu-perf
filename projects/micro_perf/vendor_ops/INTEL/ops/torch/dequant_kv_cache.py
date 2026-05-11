@@ -120,13 +120,13 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 shape=self.quant_scale_shape,
                 dtype=torch.float32,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.empty,
+                creator=torch.ones,
             ),
             "v_scale": OpTensorInfo(
                 shape=self.quant_scale_shape,
                 dtype=torch.float32,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.empty,
+                creator=torch.ones,
             ),
         }
         self.output_tensor_info = {}
@@ -144,13 +144,11 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.empty,
             )
             self.input_tensor_info["v_cache"] = OpTensorInfo(
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.empty,
             )
             self.output_tensor_info["dequant_k_cache"] = OpTensorInfo(
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim],
@@ -178,13 +176,11 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.empty,
             )
             self.input_tensor_info["v_cache"] = OpTensorInfo(
                 shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.empty,
             )
             self.output_tensor_info["dequant_k_cache"] = OpTensorInfo(
                 shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],

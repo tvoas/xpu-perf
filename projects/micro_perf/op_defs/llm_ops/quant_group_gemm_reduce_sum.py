@@ -40,7 +40,6 @@ class QuantGroupGemmReduceSumOp(BasicOp):
                 shape=[self.sp_size, self.num_tokens, self.hidden_size], 
                 dtype=self.torch_dtype, 
                 device=self.backend.get_torch_device_name(),
-                creator=torch.zeros
             ), 
             "per_token_scale": OpTensorInfo(
                 shape=[self.sp_size, self.num_tokens], 
@@ -53,7 +52,6 @@ class QuantGroupGemmReduceSumOp(BasicOp):
                     if self.trans_w else [self.sp_size, self.hidden_size, self.new_hidden_size], 
                 dtype=self.torch_dtype, 
                 device=self.backend.get_torch_device_name(),
-                creator=torch.zeros
             ), 
             "weight_scale": OpTensorInfo(
                 shape=[self.sp_size, self.new_hidden_size], 

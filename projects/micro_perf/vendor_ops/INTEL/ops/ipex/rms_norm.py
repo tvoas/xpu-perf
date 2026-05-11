@@ -54,7 +54,6 @@ try:
                     shape=[self.batch_size, self.dim_size],
                     dtype=self.torch_dtype,
                     device=self.backend.get_torch_device_name(),
-                    creator=torch.empty
                 )
             }
             self.output_tensor_info = {

@@ -198,13 +198,11 @@ class FlashAttentionOp(BasicOp):
             shape=cache_shape, 
             dtype=self.cache_torch_dtype, 
             device=self.backend.get_torch_device_name(), 
-            creator=torch.empty
         )
         self.input_tensor_info["v_cache"] = OpTensorInfo(
             shape=cache_shape, 
             dtype=self.cache_torch_dtype, 
             device=self.backend.get_torch_device_name(), 
-            creator=torch.empty
         )
         
         """
