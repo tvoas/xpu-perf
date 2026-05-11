@@ -61,7 +61,7 @@ def run_perf(backend, op_instance):
 
     try:
         min_test_iters = 2
-        max_test_iters = 10
+        max_test_iters = 1000
         max_test_time = 5e4     # 50 ms
         # --- iter / data-cnt caps ---
         min_iters = 3 if _should_throttle(op_instance) else 10
