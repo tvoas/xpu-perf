@@ -24,6 +24,14 @@ class SyclExtMoeSwigluDynamicQuantOp(MoeSwigluDynamicQuantOp):
         self.extra_providers = ["sycl_ext"]
         self._run_func = self.moe_swiglu_dynamic_quant_run
 
+    def vendor_parser(self):
+        if self.dtype in ["bfloat16", "float16"] and self.dst_dtype in ["int8", "float8", "float8_e4m3", "float8_e4m3fn"]:
+            pass
+        else:
+            raise ValueError(
+                f"SyclExtMoeSwigluDynamicQuantOp not support dtype {self.dtype} dst_dtype {self.dst_dtype}"
+            )
+
     def moe_swiglu_dynamic_quant_run(self, tensor_mapping):
         if sycl_ext is None:
             raise RuntimeError("moe_swiglu_dynamic_quant_sycl.so not found. Did you run build.sh?")

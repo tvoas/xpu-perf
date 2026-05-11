@@ -79,8 +79,7 @@ void moe_scatter_dynamic_quant_impl(
     auto ext_tokens_start_ptr = experts_token_start.data_ptr<int32_t>();
     auto token_to_scatter_offset_ptr = token_to_scatter_offset.data_ptr<int32_t>();
 
-    // UNIFIED ROUTING PASS: Replaces Pass 0, Pass 1, and Pass 2, eliminating two
-    // kernel launch overheads (~15us+ saved) and all global atomics.
+    // Unified routing pass for expert token statistics
     auto routing_event = queue.submit([&](sycl::handler& cgh) {
         sycl::local_accessor<int32_t, 1> local_expert_counts(n_expert_total, cgh);
 
@@ -131,7 +130,7 @@ void moe_scatter_dynamic_quant_impl(
     auto scatter_per_token_scale_ptr = scatter_per_token_scale.data_ptr<float>();
     auto scatter_tokens_offset_ptr = scatter_tokens_offset.data_ptr<int32_t>();
 
-    // Pass 3: Gather, quantize, and scatter
+    // Gather, quantize, and scatter
     auto launch_scatter = [&](auto unroll_tag) {
         constexpr int UNROLL = decltype(unroll_tag)::value;
         constexpr int CHUNK = 64;
@@ -167,7 +166,7 @@ void moe_scatter_dynamic_quant_impl(
 
                 simd<float, CHUNK> thread_max_vec = 0.0f;
 
-                // Pass 1 (Removed Cache Hints)
+                // Pass 1: Read, compute, track extrema, and cache to SLM
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
@@ -209,7 +208,7 @@ void moe_scatter_dynamic_quant_impl(
                 this_token_scale = slm_block_load<float, 4>(1024)[0];
                 float recip_scale = 1.0f / this_token_scale;
 
-                // Pass 2 (Removed Cache Hints)
+                // Pass 2: Quantize using SLM cached scaling factors
                 for (int hd_bid = loc_id; hd_bid < num_blocks; hd_bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {

@@ -2361,6 +2361,8 @@ class MoeScatterDynamicQuantOp(BasicOp):
         self.dst_dtype = self.args_dict["dst_dtype"]
         self.dst_torch_dtype = get_torch_dtype(self.dst_dtype)
 
+        self.vendor_parser()
+
         # predefined attrs
         self.num_tokens = self.args_dict["num_tokens"]
         self.hidden_size = self.args_dict["hidden_size"]
@@ -2539,6 +2541,13 @@ class MoeScatterDynamicQuantOp(BasicOp):
         # run func
         self._run_func = self.moe_scatter_dynamic_quant_run
 
+    def vendor_parser(self):
+        if self.dtype == "bfloat16" and self.dst_dtype == "int8":
+            pass
+        else:
+            raise ValueError(
+                f"MoeScatterDynamicQuantOp base impl not support dtype {self.dtype} dst_dtype {self.dst_dtype}"
+            )
 
     def moe_scatter_dynamic_quant_run(self, tensor_mapping):
         # get pre-allocated input tensors
@@ -3121,7 +3130,7 @@ class MoeSwigluDynamicQuantOp(BasicOp):
 
 
     def vendor_parser(self):
-        if self.dtype in ["bfloat16", "float16"] and self.dst_dtype in ["int8", "float8", "float8_e4m3", "float8_e4m3fn"]:
+        if self.dtype == "bfloat16" and self.dst_dtype == "int8":
             pass
         else:
             raise ValueError(

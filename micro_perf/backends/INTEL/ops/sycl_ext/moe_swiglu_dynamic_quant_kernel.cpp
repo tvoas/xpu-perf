@@ -85,7 +85,7 @@ void moe_swiglu_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
-                slm_init(SLM_BYTES); // Constexpr literal statically passed to compiler
+                slm_init(SLM_BYTES);
 
                 const int loc_id = item.get_local_id(1);
                 const int flat_idx = item.get_group(0);
@@ -101,7 +101,7 @@ void moe_swiglu_dynamic_quant_impl(
 
                 simd<float, CHUNK> thread_max_vec = 0.0f;
 
-                // Pass 1: Read, compute, track extrema, and CACHE to SLM
+                // Pass 1: Read, compute, track extrema, and cache to SLM
                 for (int bid = loc_id; bid < num_blocks; bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
@@ -117,7 +117,6 @@ void moe_swiglu_dynamic_quant_impl(
 
                         thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(scaled_swiglu_tokens));
 
-                        // Write to SLM (Fallback 16-stride loop guarantees successful JIT on all formats)
                         uint32_t base_offset = (bid * BS + u * CHUNK) * 4;
 #pragma unroll
                         for (int i = 0; i < 4; ++i) {
@@ -150,7 +149,7 @@ void moe_swiglu_dynamic_quant_impl(
                 this_token_scale = slm_block_load<float, 4>(reduction_base + 1024)[0];
                 float recip_scale = 1.0f / this_token_scale;
 
-                // Pass 2: ZERO Global Reads, ZERO Arithmetic functions! Fast-fetch SLM output.
+                // Pass 2: Quantize using SLM cached scaling factors
                 for (int bid = loc_id; bid < num_blocks; bid += wg_size) {
 #pragma unroll
                     for (int u = 0; u < UNROLL; ++u) {
