@@ -87,7 +87,6 @@ if hasattr(torch, "float8_e4m3fn"):
     TORCH_DTYPE_MAPPING.update({
         "float8": TorchDtypeInfo(torch.float8_e4m3fn, 1, float_creator),
         "float8_e4m3": TorchDtypeInfo(torch.float8_e4m3fn, 1, float_creator),
-        "float8_e4m3fn": TorchDtypeInfo(torch.float8_e4m3fn, 1, float_creator),
         "float8_e5m2": TorchDtypeInfo(torch.float8_e5m2, 1, float_creator),
 
         "mxfloat8": TorchDtypeInfo(torch.float8_e4m3fn, 1, float_creator),
@@ -117,8 +116,6 @@ for dtype_str, dtype_info in TORCH_DTYPE_MAPPING.items():
 
 
 def get_torch_dtype(dtype: str) -> torch.dtype:
-    if dtype not in TORCH_DTYPE_MAPPING:
-        raise ValueError(f"Unsupported dtype: {dtype}")
     return TORCH_DTYPE_MAPPING[dtype].torch_dtype
 
 def get_torch_dtype_size(dtype: torch.dtype) -> int | float:

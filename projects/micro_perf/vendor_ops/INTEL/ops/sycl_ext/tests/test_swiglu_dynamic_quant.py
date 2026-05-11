@@ -6,10 +6,10 @@ import torch
 torch.manual_seed(42)
 
 # Dynamically load the localized SYCL extension
-so_path = os.path.join(os.path.dirname(__file__), "..", "moe_swiglu_dynamic_quant_sycl.so")
+so_path = os.path.join(os.path.dirname(__file__), "..", "swiglu_dynamic_quant_sycl.so")
 if not os.path.exists(so_path):
     raise RuntimeError(f"Could not find {so_path}. Did you run build.sh?")
-spec = importlib.util.spec_from_file_location("moe_swiglu_dynamic_quant_sycl", so_path)
+spec = importlib.util.spec_from_file_location("swiglu_dynamic_quant_sycl", so_path)
 sycl_ext = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(sycl_ext)
 
@@ -50,18 +50,19 @@ def quantize_reference(values, dst_dtype):
     return quantized, scale
 
 
-def baseline_moe_swiglu(scatter_tokens, smooth_scale, scatter_expert_ids, dst_dtype):
-    """Pure PyTorch vectorized baseline for MoE SwiGLU + Dynamic Quantization."""
-    hidden_size = scatter_tokens.shape[1] // 2
+def baseline_swiglu(hidden_states, smooth_scale, dst_dtype):
+    """Pure PyTorch vectorized baseline for SwiGLU + Dynamic Quantization."""
+    hidden_size = hidden_states.shape[1] // 2
 
-    token_scales = smooth_scale[scatter_expert_ids.long()].float()
-
-    x1 = scatter_tokens[:, :hidden_size].float()
-    x2 = scatter_tokens[:, hidden_size:].float()
+    x1 = hidden_states[:, :hidden_size].float()
+    x2 = hidden_states[:, hidden_size:].float()
 
     x1_silu = torch.nn.functional.silu(x1)
     swiglu = x1_silu * x2
-    scaled = swiglu * token_scales
+    
+    # In standard SwiGLU, smooth_scale is a 1D tensor [hidden_size]
+    # We broadcast it across all tokens.
+    scaled = swiglu * smooth_scale.float().unsqueeze(0)
 
     unquantized_math = scaled
 
@@ -70,48 +71,32 @@ def baseline_moe_swiglu(scatter_tokens, smooth_scale, scatter_expert_ids, dst_dt
     return quant_tokens, per_token_scale, unquantized_math
 
 
-@pytest.mark.parametrize("num_scattered", [1, 64, 1024, 4096])
-@pytest.mark.parametrize("hidden_size", [64, 128, 2048, 8192])
-@pytest.mark.parametrize("num_experts", [1, 64, 256])
+@pytest.mark.parametrize("num_tokens", [1, 40, 80, 4096])
+@pytest.mark.parametrize("hidden_size", [256, 2048, 3072, 7168])
 @pytest.mark.parametrize("src_dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("dst_dtype", [torch.int8, torch.float8_e4m3fn])
-def test_moe_swiglu_dynamic_quant(num_scattered, hidden_size, num_experts, src_dtype, dst_dtype):
+def test_swiglu_dynamic_quant(num_tokens, hidden_size, src_dtype, dst_dtype):
     device = "xpu"
 
-    experts_token_count = torch.zeros(num_experts, dtype=torch.int32, device=device)
-    experts_token_start = torch.zeros(num_experts, dtype=torch.int32, device=device)
+    hidden_states = torch.randn((num_tokens, hidden_size * 2), dtype=src_dtype, device=device)
+    # Note: smooth_scale is just [hidden_size] here, unlike MoE.
+    smooth_scale = torch.rand((hidden_size,), dtype=torch.float32, device=device)
 
-    tokens_per_expert = num_scattered // num_experts
-    experts_token_count[:] = tokens_per_expert
-    experts_token_count[-1] = num_scattered - (tokens_per_expert * (num_experts - 1))
-
-    if num_experts > 1:
-        experts_token_start[1:] = torch.cumsum(experts_token_count[:-1], dim=0)
-    max_token_num = int(experts_token_count.max().item())
-    scatter_expert_ids = torch.repeat_interleave(
-        torch.arange(num_experts, dtype=torch.int32, device=device),
-        experts_token_count.to(torch.int64)
-    )
-
-    scatter_tokens = torch.randn((num_scattered, hidden_size * 2), dtype=src_dtype, device=device)
-    smooth_scale = torch.rand((num_experts, hidden_size), dtype=torch.float32, device=device)
-
-    out_quant_tokens = torch.zeros((num_scattered, hidden_size), dtype=dst_dtype, device=device)
-    out_per_scale = torch.zeros(num_scattered, dtype=torch.float32, device=device)
+    out_quant_tokens = torch.zeros((num_tokens, hidden_size), dtype=dst_dtype, device=device)
+    out_per_scale = torch.zeros(num_tokens, dtype=torch.float32, device=device)
 
     # 1. Base Accuracy Reference
-    ref_quant_tokens, ref_per_scale, ref_unquantized_tokens = baseline_moe_swiglu(
-        scatter_tokens, smooth_scale, scatter_expert_ids, dst_dtype
+    ref_quant_tokens, ref_per_scale, ref_unquantized_tokens = baseline_swiglu(
+        hidden_states, smooth_scale, dst_dtype
     )
 
     out_quant_tokens.zero_()
     out_per_scale.zero_()
 
     # 2. XPU Kernel Output via sycl_ext
-    sycl_ext.moe_swiglu_dynamic_quant(
-        scatter_tokens, smooth_scale, experts_token_count, experts_token_start,
-        scatter_expert_ids,
-        out_quant_tokens, out_per_scale, num_experts, max_token_num
+    sycl_ext.swiglu_dynamic_quant(
+        hidden_states, smooth_scale,
+        out_quant_tokens, out_per_scale
     )
     torch.xpu.synchronize()
 
