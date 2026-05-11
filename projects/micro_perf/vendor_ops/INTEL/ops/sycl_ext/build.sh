@@ -48,10 +48,10 @@ BMG_10_LINK_FLAGS=(-Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
 # Auto-detect BMG device target: bmg-g21 (B580/B570) or bmg-g31 (B770/B740)
 # Override with: BMG_DEVICE=bmg-g21 bash build.sh
 if [[ -z "${BMG_DEVICE:-}" ]]; then
-    # 0xe20b/0xe20c = B580/B570 (G21), 0xe223/0xe202 = B770/B740 (G31)
+    # 0xe20b/0xe20c = B580/B570 (G21), 0xe211/0xe212 = Pro B60/B50 (G21), 0xe223/0xe202 = B770/B740 (G31)
     PCI_ID=$(xpu-smi discovery 2>/dev/null | grep -oP 'Device Name:.*\[\K0x[0-9a-fA-F]+' | head -1 || true)
     case "$PCI_ID" in
-        0xe20b|0xe20c) BMG_DEVICE="bmg-g21" ;;
+        0xe20b|0xe20c|0xe211|0xe212) BMG_DEVICE="bmg-g21" ;;
         0xe223|0xe202) BMG_DEVICE="bmg-g31" ;;
         *)             BMG_DEVICE="bmg-g31"; echo "WARNING: Unknown PCI ID '$PCI_ID', defaulting to $BMG_DEVICE" ;;
     esac
