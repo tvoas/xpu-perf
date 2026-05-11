@@ -28,6 +28,18 @@ try:
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["sycl_ext"]
 
+        def vendor_parser(self):
+            # sycl_ext supports int8 / float8 (e4m3) outputs. The "float8"
+            # workload alias maps to torch.float8_e4m3fn in TORCH_DTYPE_MAPPING.
+            if self.dtype in ("bfloat16", "float16") \
+                and self.dst_dtype in ("int8", "float8"):
+                return
+            raise ValueError(
+                f"{type(self).__name__} only supports bfloat16/float16 -> "
+                f"int8/float8, but got "
+                f"dtype={self.dtype}, dst_dtype={self.dst_dtype}"
+            )
+
         def vendor_impl(self):
             super().vendor_impl()
             self._create_tensors_func = partial(
