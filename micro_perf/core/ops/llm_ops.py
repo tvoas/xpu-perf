@@ -3115,12 +3115,6 @@ class MoeSwigluDynamicQuantOp(BasicOp):
             for _ in range(token_count)
         ]
 
-        self.scatter_expert_ids = [
-            expert_idx
-            for expert_idx, token_count in enumerate(self.expert_dispatch_token_count)
-            for _ in range(token_count)
-        ]
-
         # 以下参数决定 moe_swiglu_dynamic_quant 的具体数据类型
         self.dtype = self.args_dict.get("dtype", "bfloat16")
         self.dst_dtype = self.args_dict.get("dst_dtype", "int8")
