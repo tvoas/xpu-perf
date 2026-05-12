@@ -12,6 +12,21 @@ using namespace sycl::ext::intel::esimd;
 using bf16 = sycl::ext::oneapi::bfloat16;
 using fp16 = sycl::half;
 
+/*
+ * Grouped MoE SwiGLU + per-token dynamic quantization.
+ *
+ * Contract:
+ *   - scatter_tokens is already laid out in dispatch order as
+ *     [dispatch_tokens, 2 * hidden_size].
+ *   - experts_token_count / experts_token_start describe contiguous expert
+ *     segments inside that dispatch buffer.
+ *   - scatter_expert_ids gives the owning expert for each dispatch row.
+ *
+ * Each work-group processes one scattered token row. The kernel computes the
+ * SwiGLU activation, applies that row's expert smooth_scale, performs a row-wise
+ * max reduction, then quantizes the row using the derived dynamic scale.
+ */
+
 template <typename decl_tag> struct QuantMax;
 template <> struct QuantMax<int8_t> { static constexpr float value = 127.0f; };
 template <> struct QuantMax<uint8_t> { static constexpr float value = 448.0f; }; // e4m3fn max value
@@ -41,7 +56,6 @@ inline simd<uint8_t, N> fast_cvt_float_to_e4m3fn(simd<float, N> x) {
 
     return res;
 }
-
 
 template <typename T_in, typename T_out>
 void moe_swiglu_dynamic_quant_impl(
@@ -179,6 +193,8 @@ void moe_swiglu_dynamic_quant_impl(
         });
     };
 
+    // Like the plain SwiGLU kernel, SLM usage is bucketed by hidden_size so the
+    // compiler sees a fixed local-memory footprint for each launch variant.
     auto dispatch_slm = [&](auto unroll_tag) {
         if (hidden_size <=   128) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,   2560>{}); //   128 * 4 + 2048
         if (hidden_size <=   256) return launch_swiglu(unroll_tag, std::integral_constant<uint32_t,   3072>{}); //   256 * 4 + 2048
@@ -206,8 +222,8 @@ void moe_swiglu_dynamic_quant_impl(
     int num_chunks = hidden_size / 64;
     int best_unroll = 1;
 
-    // Find the largest UNROLL that cleanly divides memory AND
-    // preserves enough active blocks to meet target_wg.
+    // Find the largest UNROLL that cleanly divides the row while still leaving
+    // enough independent blocks to keep the work-group busy.
     for (int u : {8, 4, 2}) {
         if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
             best_unroll = u;
