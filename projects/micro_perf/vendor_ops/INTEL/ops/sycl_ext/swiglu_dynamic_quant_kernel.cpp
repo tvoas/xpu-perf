@@ -173,11 +173,11 @@ void swiglu_dynamic_quant_impl(
                                   return launch_swiglu(unroll_tag, std::integral_constant<uint32_t, 131072>{}); // 32256 * 4 + 2048
     };
 
-    int target_wg = 16;
+    int target_wg = 1;
     int num_chunks = hidden_size / 64;
     int best_unroll = 1;
 
-    for (int u : {16, 8, 4, 2}) {
+    for (int u : {32, 16, 8, 4, 2}) {
         if (num_chunks % u == 0 && (num_chunks / u) >= target_wg) {
             best_unroll = u;
             break;
