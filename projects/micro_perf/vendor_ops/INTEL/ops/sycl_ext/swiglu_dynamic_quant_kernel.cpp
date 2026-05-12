@@ -55,9 +55,8 @@ void swiglu_dynamic_quant_impl(
     int hidden_size = hidden_states.size(1) / 2;
     constexpr float quant_max = QuantMax<T_out>::value;
 
-    auto launch_swiglu = [&](auto unroll_tag, auto slm_tag) {
+    auto launch_swiglu = [&](auto unroll_tag) {
         constexpr int UNROLL = decltype(unroll_tag)::value;
-        constexpr uint32_t SLM_BYTES = decltype(slm_tag)::value;
         constexpr int CHUNK = 64;
         constexpr int BS = CHUNK * UNROLL;
 
@@ -69,48 +68,33 @@ void swiglu_dynamic_quant_impl(
 
         queue.submit([&](sycl::handler& cgh) {
             cgh.parallel_for(sycl::nd_range<2>(GlobalRange, LocalRange), [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL [[intel::kernel_args_restrict]] {
+                slm_init(1056);
+
                 int token_idx = item.get_global_id(0);
                 int tid = item.get_local_id(1);
 
-                // SLM allocation for max reduction
-                slm_init(SLM_BYTES);
-
                 auto in_row_ptr = hidden_states_ptr + token_idx * (hidden_size * 2);
                 auto out_row_ptr = quant_tokens_ptr + token_idx * hidden_size;
+                uint32_t reduction_base = hidden_size * sizeof(float);
 
-                float local_max = 0.0f;
+                simd<float, CHUNK> thread_max_vec = 0.0f;
 
-                // Pass 1: compute swiglu, load scales, find max
-                for (int i = tid; i < num_blocks; i += wg_size) {
-                    int offset = i * BS;
-                    
-                    simd<T_in, BS> x1_vec;
-                    x1_vec.copy_from(in_row_ptr + offset);
-                    simd<float, BS> x1 = x1_vec;
-
-                    simd<T_in, BS> x2_vec;
-                    x2_vec.copy_from(in_row_ptr + hidden_size + offset);
-                    simd<float, BS> x2 = x2_vec;
-
-                    // silu(x1) * x2
-                    simd<float, BS> x1_silu = x1 / (1.0f + sycl::ext::intel::esimd::exp(-x1));
-                    simd<float, BS> swiglu = x1_silu * x2;
-
-                    // scale
-                    simd<float, BS> scale_vec;
-                    scale_vec.copy_from(smooth_scale_ptr + offset);
-                    simd<float, BS> scaled = swiglu * scale_vec;
-
-                    simd<float, BS> scaled_abs = sycl::ext::intel::esimd::abs(scaled);
-                    float block_max = hmax<float, float, BS>(scaled_abs);
-                    if (block_max > local_max) local_max = block_max;
+                for (int bid = tid; bid < num_blocks; bid += wg_size) {
+#pragma unroll
+                    for (int u = 0; u < UNROLL; ++u) {
+                        simd<T_in, CHUNK> x1 = block_load<T_in, CHUNK>(in_row_ptr + bid * BS + u * CHUNK);
+                        simd<T_in, CHUNK> x2 = block_load<T_in, CHUNK>(in_row_ptr + hidden_size + bid * BS + u * CHUNK);
+                        simd<float, CHUNK> scale = block_load<float, CHUNK>(smooth_scale_ptr + bid * BS + u * CHUNK);
+                        simd<float, CHUNK> sigmoid = sycl::ext::intel::esimd::inv(1.0f + sycl::ext::intel::esimd::exp(-simd<float, CHUNK>(x1)));
+                        simd<float, CHUNK> scaled = (simd<float, CHUNK>(x1) * sigmoid) * simd<float, CHUNK>(x2) * scale;
+                        thread_max_vec = sycl::ext::intel::esimd::max(thread_max_vec, sycl::ext::intel::esimd::abs(scaled));
+                    }
                 }
 
+                float local_max = hmax<float, float, CHUNK>(thread_max_vec);
                 slm_block_store<float, 4>(tid * 16, simd<float, 4>(local_max));
                 barrier();
 
-                // WG-level reduction for global max
-                float inv_scale = 1.0f;
                 if (tid == 0) {
                     float token_max = 0.0f;
                     for (int i = 0; i < wg_size; i++) {
@@ -120,49 +104,56 @@ void swiglu_dynamic_quant_impl(
                     float token_scale_val = token_max / quant_max;
                     token_scale_val = (token_scale_val == 0.0f) ? 1.0f : token_scale_val;
                     per_token_scale_ptr[token_idx] = token_scale_val;
-                    slm_block_store<float, 4>(1024, simd<float, 4>(1.0f / token_scale_val)); // inverse scale
+                    slm_block_store<float, 4>(1024, simd<float, 4>(1.0f / token_scale_val));
                 }
                 barrier();
-                inv_scale = slm_block_load<float, 4>(1024)[0];
+                float inv_scale = slm_block_load<float, 4>(1024)[0];
 
-                // Pass 2: Quantize and write
-                for (int i = tid; i < num_blocks; i += wg_size) {
-                    int offset = i * BS;
-
-                    simd<T_in, BS> x1_vec;
-                    x1_vec.copy_from(in_row_ptr + offset);
-                    simd<float, BS> x1 = x1_vec;
-
-                    simd<T_in, BS> x2_vec;
-                    x2_vec.copy_from(in_row_ptr + hidden_size + offset);
-                    simd<float, BS> x2 = x2_vec;
-
-                    simd<float, BS> x1_silu = x1 / (1.0f + sycl::ext::intel::esimd::exp(-x1));
-                    simd<float, BS> swiglu = x1_silu * x2;
-
-                    simd<float, BS> scale_vec;
-                    scale_vec.copy_from(smooth_scale_ptr + offset);
-                    simd<float, BS> scaled = swiglu * scale_vec;
-
-                    if constexpr (std::is_same_v<T_out, int8_t>) {
-                        simd<float, BS> q_f32 = rnde<float>(scaled * inv_scale);
-                        simd<int8_t, BS> q_dst = sycl::ext::intel::esimd::convert<int8_t>(q_f32);
-                        q_dst.copy_to(out_row_ptr + offset);
-                    } else { // FP8 e4m3fn
-                        simd<float, BS> q_f32 = scaled * inv_scale;
-                        simd<uint8_t, BS> q_dst = fast_cvt_float_to_e4m3fn<BS>(q_f32);
-                        q_dst.copy_to(out_row_ptr + offset);
+                for (int bid = tid; bid < num_blocks; bid += wg_size) {
+#pragma unroll
+                    for (int u = 0; u < UNROLL; ++u) {
+                        simd<T_in, CHUNK> x1 = block_load<T_in, CHUNK>(in_row_ptr + bid * BS + u * CHUNK);
+                        simd<T_in, CHUNK> x2 = block_load<T_in, CHUNK>(in_row_ptr + hidden_size + bid * BS + u * CHUNK);
+                        simd<float, CHUNK> scale = block_load<float, CHUNK>(smooth_scale_ptr + bid * BS + u * CHUNK);
+                        simd<float, CHUNK> sigmoid = sycl::ext::intel::esimd::inv(1.0f + sycl::ext::intel::esimd::exp(-simd<float, CHUNK>(x1)));
+                        simd<float, CHUNK> scaled = (simd<float, CHUNK>(x1) * sigmoid) * simd<float, CHUNK>(x2) * scale;
+                        
+                        simd<T_out, CHUNK> quantized_out;
+                        if constexpr (std::is_same_v<T_out, int8_t>) {
+                            quantized_out = rnde<float>(scaled * inv_scale);
+                        } else {
+                            quantized_out = fast_cvt_float_to_e4m3fn<CHUNK>(scaled * inv_scale);
+                        }
+                        block_store<T_out, CHUNK>(out_row_ptr + bid * BS + u * CHUNK, quantized_out);
                     }
                 }
             });
         });
     };
 
-    // Standard unroll logic for SLM bounding (matching MoE sizes)
-    if (hidden_size <= 28672) {
-        launch_swiglu(std::integral_constant<int, 4>{}, std::integral_constant<uint32_t, 2048>{});
-    } else {
-        launch_swiglu(std::integral_constant<int, 4>{}, std::integral_constant<uint32_t, 4096>{});
+    int target_total_threads = 128;
+    auto is_valid_unroll = [&](int unroll) {
+        int bs = unroll * 64;
+        int max_wg_size = std::min(hidden_size / bs, 64);
+        return (hidden_size % bs == 0) && ((num_tokens * max_wg_size) >= target_total_threads);
+    };
+
+    int best_unroll = 1;
+
+    for (int unroll : {4, 2, 1}) {
+        if (is_valid_unroll(unroll)) {
+            best_unroll = unroll;
+            break;
+        }
+    }
+
+    switch (best_unroll) {
+        case 32:  return launch_swiglu(std::integral_constant<int, 32>{});
+        case 16:  return launch_swiglu(std::integral_constant<int, 16>{});
+        case 8:  return launch_swiglu(std::integral_constant<int, 8>{});
+        case 4:  return launch_swiglu(std::integral_constant<int, 4>{});
+        case 2:  return launch_swiglu(std::integral_constant<int, 2>{});
+        default: return launch_swiglu(std::integral_constant<int, 1>{});
     }
 }
 
