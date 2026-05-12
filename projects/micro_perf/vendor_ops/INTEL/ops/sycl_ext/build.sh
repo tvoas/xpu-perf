@@ -222,6 +222,36 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     $SYCL_TLA_LINK_LIBS \
     $TORCH_LIBS -ltorch -ltorch_python -lc10
 
+build_async moe_swiglu_dynamic_quant_sycl \
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=moe_swiglu_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    moe_swiglu_dynamic_quant_kernel.cpp \
+    -o moe_swiglu_dynamic_quant_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+build_async moe_scatter_dynamic_quant_sycl \
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=moe_scatter_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    moe_scatter_dynamic_quant_kernel.cpp \
+    -o moe_scatter_dynamic_quant_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
+build_async swiglu_dynamic_quant_sycl \
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=swiglu_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    swiglu_dynamic_quant_kernel.cpp \
+    -o swiglu_dynamic_quant_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
 build_async quant_matmul_sycl \
 icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -DTORCH_EXTENSION_NAME=quant_matmul_sycl \
