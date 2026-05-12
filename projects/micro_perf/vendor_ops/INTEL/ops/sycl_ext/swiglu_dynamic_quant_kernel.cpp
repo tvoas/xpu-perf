@@ -131,7 +131,7 @@ void swiglu_dynamic_quant_impl(
         });
     };
 
-    int target_total_threads = 512;
+    int target_total_threads = 1024;
     auto is_valid_unroll = [&](int unroll) {
         int bs = unroll * 64;
         int max_wg_size = std::min(hidden_size / bs, 64);
