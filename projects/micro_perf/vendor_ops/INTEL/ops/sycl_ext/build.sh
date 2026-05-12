@@ -73,6 +73,15 @@ build_async() {
 }
 
 # --- Simple SYCL extensions (no sycl-tla) ---
+build_async add_rms_norm_dynamic_quant_sycl \
+icpx -fsycl -shared -fPIC -O2 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=add_rms_norm_dynamic_quant_sycl \
+	$TORCH_INCLUDES \
+	-I"$PYTHON_INCLUDE" \
+	add_rms_norm_dynamic_quant_kernel.cpp \
+	-o add_rms_norm_dynamic_quant_sycl.so \
+	$TORCH_LIBS \
+	-ltorch -ltorch_python -lc10
 
 build_async store_kv_cache_sycl \
 icpx -fsycl -shared -fPIC -O2 -std=c++17 \
