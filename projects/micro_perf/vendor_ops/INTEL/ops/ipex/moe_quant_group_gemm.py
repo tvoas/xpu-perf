@@ -216,12 +216,12 @@ try:
 
             if self.arg_type == "llm":
                 # Support both formats: m/n/k or num_tokens/hidden_size/new_hidden_size
-                self.m = self.args_dict.get("m", self.args_dict.get("num_tokens", 0) // self.args_dict.get("sp_size", 1))
+                self.m = self.args_dict.get("m", self.args_dict.get("num_tokens", 0))
                 self.k = self.args_dict.get("k", self.args_dict.get("hidden_size", 0))
                 self.n = self.args_dict.get("n", self.args_dict.get("new_hidden_size", 0))
                 self.m_scattered = self.m * self.topk  
                 self.group_num = self.k // quant_group_size  if self.dtype=="w4a8" else 1
-                if self.dtype in ["w4a8", "w8a8"]:
+                if self.dtype in ["w4a8", "w8a8", "bfloat16", "float16", "float32", "tfloat32"]:
                     self.dispatch_tokens = self.m_scattered // ep_size
                     token_per_exp = self.dispatch_tokens // self.n_experts
                     token_rem = self.dispatch_tokens % self.n_experts
@@ -229,10 +229,11 @@ try:
                     for i in range(token_rem):
                         self.expert_dispatch_token_count[i] += 1
                     self.active_tokens = sum(self.expert_dispatch_token_count)
-                    self.aligned_active_tokens = sum(
-                        _aligned_token_count(token_count)
-                        for token_count in self.expert_dispatch_token_count
-                    )
+                    if self.dtype in ["w4a8", "w8a8"]:
+                        self.aligned_active_tokens = sum(
+                            _aligned_token_count(token_count)
+                            for token_count in self.expert_dispatch_token_count
+                        )
             elif self.arg_type == "default":
                 self.M = self.args_dict["M"]
                 self.K = self.args_dict["K"]
@@ -347,25 +348,53 @@ try:
             else:
                 # Non-quant dtypes (bfloat16, float16, float32, etc.)
                 if self.arg_type == "llm":
-                    m, k, n = self.m, self.k, self.n
+                    m, k, n = self.active_tokens, self.k, self.n
+                    trans_w = self.args_dict.get("trans_w", False)
+                    w_shape = [self.n_experts, self.k, self.n] if trans_w else [self.n_experts, self.n, self.k]
+                    self.trans_w = trans_w
+                    self.input_tensor_info = {
+                        "a": OpTensorInfo(
+                            shape=[m, k],
+                            dtype=self.torch_dtype,
+                            device=self.backend.get_torch_device_name()),
+                        "b": OpTensorInfo(
+                            shape=w_shape,
+                            dtype=self.torch_dtype,
+                            device=self.backend.get_torch_device_name()),
+                        "experts_token_count": OpTensorInfo(
+                            shape=[self.n_experts],
+                            dtype=torch.int32,
+                            device="cpu",
+                            creator=lambda size, dtype, device: torch.tensor(
+                                self.expert_dispatch_token_count,
+                                dtype=dtype,
+                                device=device,
+                            ))
+                    }
+                    self.output_tensor_info = {
+                        "c": OpTensorInfo(
+                            shape=[m, n],
+                            dtype=self.out_dtype,
+                            device=self.backend.get_torch_device_name()),
+                    }
                 else:
                     m, k, n = self.M, self.K, self.N
-                self.input_tensor_info = {
-                    "a": OpTensorInfo(
-                        shape=[m, k],
-                        dtype=self.torch_dtype,
-                        device=self.backend.get_torch_device_name()),
-                    "b": OpTensorInfo(
-                        shape=[k, n],
-                        dtype=self.torch_dtype,
-                        device=self.backend.get_torch_device_name()),
-                }
-                self.output_tensor_info = {
-                    "c": OpTensorInfo(
-                        shape=[m, n],
-                        dtype=self.out_dtype,
-                        device=self.backend.get_torch_device_name()),
-                }
+                    self.input_tensor_info = {
+                        "a": OpTensorInfo(
+                            shape=[m, k],
+                            dtype=self.torch_dtype,
+                            device=self.backend.get_torch_device_name()),
+                        "b": OpTensorInfo(
+                            shape=[k, n],
+                            dtype=self.torch_dtype,
+                            device=self.backend.get_torch_device_name()),
+                    }
+                    self.output_tensor_info = {
+                        "c": OpTensorInfo(
+                            shape=[m, n],
+                            dtype=self.out_dtype,
+                            device=self.backend.get_torch_device_name()),
+                    }
 
 
             self.input_tensor_size = sum([calc_tensor_size(info) for info in self.input_tensor_info.values()])
@@ -385,7 +414,7 @@ try:
                 print("total_tokens", total_tokens)
             else:
                 if self.arg_type == "llm":
-                    self.calc_flops = self.m * self.n * self.k * 2
+                    self.calc_flops = self.active_tokens * self.n * self.k * 2
                 else:
                     self.calc_flops = self.M * self.N * self.K * 2
 
@@ -428,7 +457,19 @@ try:
                 a = tensor_mapping["a"]
                 b = tensor_mapping["b"]
                 c = tensor_mapping["c"]
-                torch.matmul(a, b, out=c)
+                if self.arg_type == "llm":
+                    experts_token_count = tensor_mapping["experts_token_count"]
+                    acc = 0
+                    for i in range(self.n_experts):
+                        currnt_t_exp = experts_token_count[i].item()
+                        if currnt_t_exp == 0:
+                            continue
+                        cur_tokens = a[acc:acc+currnt_t_exp]
+                        cur_weight = b[i] if self.trans_w else b[i].transpose(0, 1)
+                        torch.matmul(cur_tokens, cur_weight, out=c[acc:acc+currnt_t_exp])
+                        acc += currnt_t_exp
+                else:
+                    torch.matmul(a, b, out=c)
                 return c
 
             elif self.dtype == "int8":

@@ -53,7 +53,7 @@ if [[ -z "${BMG_DEVICE:-}" ]]; then
     case "$PCI_ID" in
         0xe20b|0xe20c|0xe211|0xe212) BMG_DEVICE="bmg-g21" ;;
         0xe223|0xe202) BMG_DEVICE="bmg-g31" ;;
-        *)             BMG_DEVICE="bmg-g31"; echo "WARNING: Unknown PCI ID '$PCI_ID', defaulting to $BMG_DEVICE" ;;
+        *)             BMG_DEVICE="bmg-g21"; echo "WARNING: Unknown PCI ID '$PCI_ID', defaulting to $BMG_DEVICE" ;;
     esac
 fi
 echo "Target device: $BMG_DEVICE"
