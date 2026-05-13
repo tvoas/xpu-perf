@@ -229,7 +229,20 @@ void scale_dynamic_quant_forward(
     return;
   }
 
-  int local_size = std::min(hidden_size, 512);
+  // local_size depends on whether we have enough tokens (= work-groups) to
+  // saturate the GPU on their own.
+  //   * Few tokens (decode): pack many lanes per WG so each WG can keep the
+  //     EUs busy on its own row.
+  //   * Many tokens (prefill): the WGs already saturate the GPU, so use the
+  //     smallest WG that still hides launch/barrier (~8 elems / lane).
+  // BMG-class GPUs have on the order of ~160 EUs; 256 tokens is a safe
+  // boundary where the small-WG regime starts paying off.
+  int local_size;
+  if (num_tokens < 256) {
+    local_size = std::min(hidden_size, 512);
+  } else {
+    local_size = std::clamp((hidden_size + 7) / 8, 32, 512);
+  }
   if (local_size > 32) {
     local_size = (local_size / 32) * 32;
   }
