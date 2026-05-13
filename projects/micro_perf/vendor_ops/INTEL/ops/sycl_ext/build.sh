@@ -163,6 +163,16 @@ icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     $TORCH_LIBS \
     -ltorch -ltorch_python -lc10 -lc10_xpu
 
+build_async head_rms_norm_dynamic_quant_sycl \
+icpx -fsycl -shared -fPIC -O3 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=head_rms_norm_dynamic_quant_sycl \
+    $TORCH_INCLUDES \
+    -I"$PYTHON_INCLUDE" \
+    head_rms_norm_dynamic_quant.cpp \
+    -o head_rms_norm_dynamic_quant_sycl.so \
+    $TORCH_LIBS \
+    -ltorch -ltorch_python -lc10 -lc10_xpu
+
 build_async scale_dynamic_quant_sycl \
 icpx -fsycl -shared -fPIC -O3 -std=c++17 \
     -DTORCH_EXTENSION_NAME=scale_dynamic_quant_sycl \
