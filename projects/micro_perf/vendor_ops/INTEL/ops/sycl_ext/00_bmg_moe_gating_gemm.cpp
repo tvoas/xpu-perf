@@ -388,9 +388,15 @@ cutlass::Status run_xe_example_with_config(const Options& options,
 cutlass::Status run_xe_example(const Options& options,
                                const cutlass::KernelHardwareInfo& hw_info) {
   if (options.m <= 64) {
-    return run_xe_example_with_config<64, 256, 32, 2, 4, 2>(options, hw_info);
+    return run_xe_example_with_config<8, 64, 32, 1, 4, 2>(options, hw_info);
   }
-  return run_xe_example_with_config<128, 128, 32, 4, 4, 3>(options, hw_info);
+  if (options.m <= 128) {
+    return run_xe_example_with_config<16, 128, 32, 2, 4, 2>(options, hw_info);
+  }
+  if (options.m <= 1024) {
+    return run_xe_example_with_config<128, 128, 32, 8, 2, 2>(options, hw_info);
+  }
+  return run_xe_example_with_config<128, 256, 32, 4, 4, 3>(options, hw_info);
 }
 
 template <typename Config>
