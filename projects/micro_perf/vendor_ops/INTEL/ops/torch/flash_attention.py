@@ -11,11 +11,6 @@ FlashAttentionOp = ProviderRegistry.BASE_IMPL_MAPPING["flash_attention"]
 from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size
 
 
-@ProviderRegistry.register_vendor_impl("flash_attention", "flash_attn")
-class FlashAttentionTorchOp(FlashAttentionOp):
-    pass
-
-
 @ProviderRegistry.register_vendor_impl("flash_attention", "torch")
 class FlashAttentionXpuOp(FlashAttentionOp):
     def __init__(self, args_dict, backend, *args, **kwargs):
