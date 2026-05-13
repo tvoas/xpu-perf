@@ -227,11 +227,15 @@ class BackendINTEL(Backend):
     def perf(self, op_instance):
         """Override base perf() with BCS-aware measurement (empty_cache before
         allocation, capped max_data_cnt for cross-device ops, reduced iters
-        for large tensors, and per-iter sync for BCS-heavy ops)."""
-        _load_xccl()
-        if run_perf is not None:
-            return run_perf(self, op_instance)
-        return super().perf(op_instance)
+        for large tensors, and per-iter sync for BCS-heavy ops).
+        Wraps with try/finally to ensure GPU memory is released on failure."""
+        try:
+            _load_xccl()
+            if run_perf is not None:
+                return run_perf(self, op_instance)
+            return super().perf(op_instance)
+        finally:
+            torch.xpu.empty_cache()
 
     def xccl_infer_loop(
         self, local_process_rank, process_mapping,
