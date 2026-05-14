@@ -4,9 +4,8 @@ from functools import partial
 
 import torch
 
-from xpu_perf.micro_perf.core.op import ProviderRegistry
-
-AddRmsNormDynamicQuantOp = ProviderRegistry.BASE_IMPL_MAPPING["add_rms_norm_dynamic_quant"]
+from xpu_perf.micro_perf.core.op import ProviderRegistry, BasicOp
+from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size
 
 
 _OP_DIR = pathlib.Path(__file__).resolve().parent
@@ -23,43 +22,121 @@ try:
 
     @ProviderRegistry.register_vendor_impl(
         "add_rms_norm_dynamic_quant", "sycl_ext")
-    class AddRmsNormDynamicQuantSyclExtOp(AddRmsNormDynamicQuantOp):
+    class AddRmsNormDynamicQuantSyclExtOp(BasicOp):
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
-            self.extra_providers = ["sycl_ext"]
 
-        def vendor_parser(self):
-            if self.dtype not in ("float16", "bfloat16"):
-                raise ValueError(
-                    f"{type(self).__name__} only supports float16/bfloat16, "
-                    f"got dtype={self.dtype}"
-                )
-            if self.dst_dtype != "int8":
-                raise ValueError(
-                    f"{type(self).__name__} only supports dst_dtype int8, "
-                    f"got dst_dtype={self.dst_dtype}"
+        def prepare(self):
+            self.arg_type = self.args_dict["arg_type"]
+            if self.arg_type not in ["llm"]:
+                raise NotImplementedError
+
+            # src_dtype
+            self.dtype = self.args_dict["dtype"]
+            if self.dtype not in ["float16", "bfloat16"]:
+                raise NotImplementedError
+            self.torch_dtype = getattr(torch, self.dtype)
+
+            # dst_dtype
+            self.dst_dtype = self.args_dict["dst_dtype"]
+            if self.dst_dtype not in ["int8"]:
+                raise NotImplementedError
+            self.dst_torch_dtype = getattr(torch, self.dst_dtype)
+
+            # pre-defined attrs
+            self.add_residual = self.args_dict.get("add_residual", True)
+            self.num_tokens = self.args_dict["num_tokens"]
+            self.hidden_size = self.args_dict["hidden_size"]
+
+            self.eps = 1e-5
+
+            # input/output tensors
+            self.input_tensor_info = {
+                "hidden_states": OpTensorInfo(
+                    shape=[self.num_tokens, self.hidden_size],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name(),
+                ),
+                "norm_weight": OpTensorInfo(
+                    shape=[self.hidden_size],
+                    dtype=torch.float32,
+                    device=self.backend.get_torch_device_name(),
+                    creator=torch.ones,
+                ),
+                "smooth_scale": OpTensorInfo(
+                    shape=[self.hidden_size],
+                    dtype=torch.float32,
+                    device=self.backend.get_torch_device_name(),
+                    creator=torch.ones,
+                ),
+            }
+            if self.add_residual:
+                self.input_tensor_info["residual"] = OpTensorInfo(
+                    shape=[self.num_tokens, self.hidden_size],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name(),
                 )
 
-        def vendor_impl(self):
-            super().vendor_impl()
+            self.output_tensor_info = {
+                "quant_tokens": OpTensorInfo(
+                    shape=[self.num_tokens, self.hidden_size],
+                    dtype=self.dst_torch_dtype,
+                    device=self.backend.get_torch_device_name(),
+                ),
+                "per_token_scale": OpTensorInfo(
+                    shape=[self.num_tokens],
+                    dtype=torch.float32,
+                    device=self.backend.get_torch_device_name(),
+                ),
+                "after_res": OpTensorInfo(
+                    shape=[self.num_tokens, self.hidden_size],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name(),
+                ),
+                "after_norm": OpTensorInfo(
+                    shape=[self.num_tokens, self.hidden_size],
+                    dtype=self.torch_dtype,
+                    device=self.backend.get_torch_device_name(),
+                ),
+            }
+
+            # calculator
+            self.input_tensor_size = sum(
+                calc_tensor_size(info)
+                for info in self.input_tensor_info.values()
+            )
+            self.output_tensor_size = sum(
+                calc_tensor_size(info)
+                for info in self.output_tensor_info.values()
+            )
+            self.tensor_size = self.input_tensor_size + self.output_tensor_size
+
+            self.read_bytes = self.input_tensor_size
+            self.write_bytes = self.output_tensor_size
+            self.io_bytes = self.read_bytes + self.write_bytes
+
+            self.algo_size = 0
+            self.bus_size = 0
+
+            # creator func
             self._create_tensors_func = partial(
                 self._create_in_out_tensors,
                 create_inputs=True,
                 create_outputs=True,
             )
-            self._run_func = self.vendor_impl_run
 
-        def vendor_impl_run(self, tensor_mapping):
+            # run func
+            self._run_func = self.add_rms_norm_dynamic_quant_run
+
+        def add_rms_norm_dynamic_quant_run(self, tensor_mapping):
             hidden_states = tensor_mapping["hidden_states"]
             residual = tensor_mapping.get("residual", None)
             norm_weight = tensor_mapping["norm_weight"]
             smooth_scale = tensor_mapping["smooth_scale"]
             quant_tokens = tensor_mapping["quant_tokens"]
             per_token_scale = tensor_mapping["per_token_scale"]
-            after_res = tensor_mapping.get("after_res",
-                torch.empty_like(hidden_states))
-            after_norm = tensor_mapping.get("after_norm",
-                torch.empty_like(hidden_states))
+            after_res = tensor_mapping["after_res"]
+            after_norm = tensor_mapping["after_norm"]
 
             # Pass empty tensor when no residual
             if residual is None:
@@ -71,11 +148,7 @@ try:
                 quant_tokens, per_token_scale, after_res, after_norm,
                 self.eps)
 
-            if self.output_mode == "none":
-                return quant_tokens, per_token_scale
-            if self.output_mode == "res":
-                return quant_tokens, per_token_scale, after_res
-            return quant_tokens, per_token_scale, after_norm
+            return quant_tokens, per_token_scale, after_res, after_norm
 
 except Exception as e:
     import warnings

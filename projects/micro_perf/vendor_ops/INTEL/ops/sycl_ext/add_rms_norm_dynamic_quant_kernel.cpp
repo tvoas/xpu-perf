@@ -1,5 +1,4 @@
 // Fused add-residual + RMS-norm + smooth-scale dynamic int8 quantization.
-// SYCL extension for xpu-perf.
 //
 // Per token (row m, hidden dim k):
 //   after_res[m,k]       = hidden_states[m,k] + residual[m,k]   (if has_residual)
@@ -8,258 +7,117 @@
 //   after_norm[m,k]      = after_res[m,k] / rms * norm_weight[k]
 //   scaled               = after_norm[m,k] * smooth_scale[k]
 //   amax[m]              = max_k |scaled|
-//   per_token_scale[m]   = amax[m] / 127                         (clamped >= 1e-10)
-//   quant_tokens[m,k]    = round(scaled / per_token_scale[m]).clamp(-128,127)
+//   per_token_scale[m]   = amax[m] / 127
+//   quant_tokens[m,k]    = round_to_nearest_even(scaled / per_token_scale[m])
 
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
 #include <ATen/ATen.h>
 #include <ATen/Dispatch.h>
 #include <c10/xpu/XPUStream.h>
-#include <sycl/sycl.hpp>
 #include <torch/extension.h>
 
-#include <algorithm>
-#include <cmath>
 #include <cstdint>
+
+using namespace sycl::ext::intel::esimd;
+using fp16 = sycl::half;
 
 namespace {
 
-// ---------- tiny helpers for vectorised loads / stores ----------
-template <typename scalar_t>
-struct vec4_t {
-  scalar_t val[4];
-};
+void add_rms_norm_dynamic_quant_launch(
+    fp16* input_ptr,
+    fp16* residual_ptr,
+    float* weight_ptr,
+    float* smooth_scale_ptr,
+    fp16* after_res_ptr,
+    fp16* after_norm_ptr,
+    int8_t* quant_tokens_ptr,
+    float* per_token_scale_ptr,
+    int const num_tokens,
+    int const hidden_size,
+    bool const has_residual,
+    float const eps,
+    sycl::queue& queue)
+{
+    constexpr int block_size = 256;
+    int const blocks = hidden_size / block_size;
+    constexpr int max_block = 32;  // 8192 / 256
+    int const quant_offset = max_block * static_cast<int>(sizeof(float));
 
-struct alignas(4) i8x4_t {
-  int8_t v[4];
-};
+    sycl::range<2> GlobalRange(num_tokens, blocks);
+    sycl::range<2> LocalRange(1, blocks);
+    sycl::nd_range<2> Range(GlobalRange, LocalRange);
 
-// ---------- kernel functor ----------
-//
-// Optimisation vs v1: keep intermediate float values in private memory
-// across passes so that after_res and after_norm are never *re-read* from
-// global memory.  This cuts global memory traffic from ~25 B/elem to
-// ~17 B/elem (−32 %).
-//
-// Inspired by the ESIMD kernel in IPEX (esimd/src/norm.cpp) which holds
-// all intermediates in SIMD registers across all three fused stages.
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(Range, [=](sycl::nd_item<2> item) SYCL_ESIMD_KERNEL {
+            slm_init(max_block * 2 * sizeof(float));
 
-template <typename scalar_t>
-class add_rms_norm_dynamic_quant_kernel {
- private:
-  // outputs
-  int8_t* quant_out_;
-  float* per_token_scale_;
-  scalar_t* after_res_;
-  scalar_t* after_norm_;
-  // inputs
-  scalar_t const* hidden_states_;
-  scalar_t const* residual_;       // may be nullptr
-  float const* norm_weight_;
-  float const* smooth_scale_;
-  int const hidden_size_;
-  float const eps_;
+            int const token_idx = item.get_global_id(0);
+            int const block_idx = item.get_local_id(1);
 
-  // Max scalar elements any single work-item will process.
-  // With wg_size = 512 this supports hidden_size up to 16 × 512 = 8 192,
-  // covering all common LLM hidden sizes.
-  static constexpr int MAX_PRIV = 16;
+            fp16*  input_base      = input_ptr     + token_idx * hidden_size + block_idx * block_size;
+            fp16*  after_res_base  = after_res_ptr  + token_idx * hidden_size + block_idx * block_size;
+            fp16*  after_norm_base = after_norm_ptr + token_idx * hidden_size + block_idx * block_size;
+            float* weight_base    = weight_ptr     + block_idx * block_size;
 
-  static inline int8_t quant_one(float v, float inv_scale) {
-    float r = v * inv_scale;
-    r = sycl::fmin(sycl::fmax(r, -128.0f), 127.0f);
-    return static_cast<int8_t>(sycl::rint(r));
-  }
+            // ---- residual stage ----
+            simd<fp16, block_size> input = block_load<fp16, block_size>(input_base);
+            if (has_residual) {
+                fp16* residual_base = residual_ptr + token_idx * hidden_size + block_idx * block_size;
+                simd<fp16, block_size> res = block_load<fp16, block_size>(residual_base);
+                input += res;
+            }
+            block_store<fp16, block_size>(after_res_base, input);
 
- public:
-  add_rms_norm_dynamic_quant_kernel(
-      int8_t* quant_out,
-      float* per_token_scale,
-      scalar_t* after_res,
-      scalar_t* after_norm,
-      scalar_t const* hidden_states,
-      scalar_t const* residual,
-      float const* norm_weight,
-      float const* smooth_scale,
-      int hidden_size,
-      float eps)
-      : quant_out_(quant_out),
-        per_token_scale_(per_token_scale),
-        after_res_(after_res),
-        after_norm_(after_norm),
-        hidden_states_(hidden_states),
-        residual_(residual),
-        norm_weight_(norm_weight),
-        smooth_scale_(smooth_scale),
-        hidden_size_(hidden_size),
-        eps_(eps) {}
+            // ---- rms norm stage ----
+            simd<float, block_size> xv_f32 = input;
+            simd<float, block_size> accv = xv_f32 * xv_f32;
+            float acc = sycl::ext::intel::esimd::detail::sum<float, float, block_size>(accv) / hidden_size;
 
-  void operator()(sycl::nd_item<1> item) const {
-    int const tid = item.get_local_id(0);
-    int const wg = item.get_local_range(0);
-    int const token_idx = item.get_group(0);
+            slm_block_store<float, 1>(block_idx * sizeof(float), acc);
 
-    int64_t const row_off =
-        static_cast<int64_t>(token_idx) * hidden_size_;
+            barrier();
 
-    scalar_t const* hs_row = hidden_states_ + row_off;
-    scalar_t const* res_row =
-        residual_ ? (residual_ + row_off) : nullptr;
-    scalar_t* ares_row = after_res_ + row_off;
-    scalar_t* anorm_row = after_norm_ + row_off;
-    int8_t* qout_row = quant_out_ + row_off;
+            simd<float, max_block> slm_sum = slm_block_load<float, max_block>(0);
+            float all_sum = sycl::ext::intel::esimd::detail::sum<float, float, max_block>(slm_sum);
+            simd<float, 1> tmp_v = all_sum + eps;
+            tmp_v = sycl::ext::intel::esimd::rsqrt(tmp_v);
+            float scale = tmp_v[0];
 
-    // Private buffer: holds float intermediates across passes so we
-    // never re-read after_res / after_norm from global memory.
-    float priv[MAX_PRIV];
+            // norm_weight is float32 in our interface (fp16 in original IPEX)
+            simd<float, block_size> yv_f32 = block_load<float, block_size>(weight_base);
+            simd<fp16, block_size> result = xv_f32 * scale * yv_f32;
+            block_store<fp16, block_size>(after_norm_base, result);
 
-    // Check vectorisation feasibility (4-element vectors).
-    bool const can_vec = (hidden_size_ % 4 == 0) &&
-        ((reinterpret_cast<uintptr_t>(hs_row) & 7u) == 0u) &&
-        (res_row == nullptr ||
-         (reinterpret_cast<uintptr_t>(res_row) & 7u) == 0u) &&
-        ((reinterpret_cast<uintptr_t>(ares_row) & 7u) == 0u);
+            // ---- quant stage ----
+            int8_t* quant_tokens_base = quant_tokens_ptr + token_idx * hidden_size + block_idx * block_size;
+            float*  per_token_scale_base = per_token_scale_ptr + token_idx;
+            float*  smooth_scale_base = smooth_scale_ptr + block_idx * block_size;
 
-    using xvec_t = vec4_t<scalar_t>;
-    using svec_t = vec4_t<float>;
-    int const num_vec = hidden_size_ >> 2;
+            simd<float, block_size> smooth_scale = block_load<float, block_size>(smooth_scale_base);
+            simd<float, block_size> smooth_input = smooth_scale * result;
+            simd<float, block_size> smooth_input_abs = sycl::ext::intel::esimd::abs(smooth_input);
+            float maxvalue = hmax<float, float, block_size>(smooth_input_abs);
+            slm_block_store<float, 1>(quant_offset + block_idx * sizeof(float), maxvalue);
 
-    // ================================================================
-    // Pass 1: add residual  +  accumulate sum-of-squares
-    //         → write after_res to global, keep float values in priv[]
-    // ================================================================
-    float thread_sum_sq = 0.0f;
-    int n_priv = 0;
+            barrier();
 
-    if (can_vec) {
-      auto const* hs_v = reinterpret_cast<xvec_t const*>(hs_row);
-      auto const* res_v =
-          res_row ? reinterpret_cast<xvec_t const*>(res_row) : nullptr;
-      auto* ares_v = reinterpret_cast<xvec_t*>(ares_row);
-
-#pragma unroll 4
-      for (int i = tid; i < num_vec; i += wg) {
-        xvec_t hv = hs_v[i];
-        xvec_t rv;
-        if (res_v) rv = res_v[i];
-        xvec_t av;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float val = static_cast<float>(hv.val[j]);
-          if (res_v) val += static_cast<float>(rv.val[j]);
-          av.val[j] = static_cast<scalar_t>(val);
-          priv[n_priv++] = val;
-          thread_sum_sq += val * val;
-        }
-        ares_v[i] = av;
-      }
-    } else {
-      for (int i = tid; i < hidden_size_; i += wg) {
-        float val = static_cast<float>(hs_row[i]);
-        if (res_row) val += static_cast<float>(res_row[i]);
-        ares_row[i] = static_cast<scalar_t>(val);
-        priv[n_priv++] = val;
-        thread_sum_sq += val * val;
-      }
-    }
-
-    // Work-group reduction for sum_sq → variance → rstd.
-    float const sum_sq = sycl::reduce_over_group(
-        item.get_group(), thread_sum_sq, sycl::plus<float>());
-
-    auto& sh1 = *sycl::ext::oneapi::group_local_memory_for_overwrite<
-        float>(item.get_group());
-    if (tid == 0) {
-      float variance = sum_sq / static_cast<float>(hidden_size_);
-      sh1 = sycl::rsqrt(variance + eps_);
-    }
-    sycl::group_barrier(item.get_group());
-    float const rstd = sh1;
-
-    // ================================================================
-    // Pass 2: RMS-norm × weight → write after_norm to global
-    //         then  × smooth_scale → absmax,  keep scaled in priv[]
-    //         (reads from priv[] instead of re-reading after_res)
-    // ================================================================
-    float thread_amax = 0.0f;
-    int pi = 0;
-
-    if (can_vec) {
-      auto const* nw_v = reinterpret_cast<svec_t const*>(norm_weight_);
-      auto const* ss_v = reinterpret_cast<svec_t const*>(smooth_scale_);
-      auto* anorm_v = reinterpret_cast<xvec_t*>(anorm_row);
-
-#pragma unroll 4
-      for (int i = tid; i < num_vec; i += wg) {
-        svec_t nw = nw_v[i];
-        svec_t ss = ss_v[i];
-        xvec_t nv;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          float normed = priv[pi] * rstd * nw.val[j];
-          nv.val[j] = static_cast<scalar_t>(normed);
-          float scaled = normed * ss.val[j];
-          priv[pi] = scaled;   // reuse slot for pass 3
-          pi++;
-          thread_amax = sycl::max(thread_amax, sycl::fabs(scaled));
-        }
-        anorm_v[i] = nv;
-      }
-    } else {
-      for (int i = tid; i < hidden_size_; i += wg) {
-        float normed = priv[pi] * rstd * norm_weight_[i];
-        anorm_row[i] = static_cast<scalar_t>(normed);
-        float scaled = normed * smooth_scale_[i];
-        priv[pi] = scaled;
-        pi++;
-        thread_amax = sycl::max(thread_amax, sycl::fabs(scaled));
-      }
-    }
-
-    // Work-group reduction for absmax.
-    float const row_amax = sycl::reduce_over_group(
-        item.get_group(), thread_amax, sycl::maximum<float>());
-
-    auto& sh2 = *sycl::ext::oneapi::group_local_memory_for_overwrite<
-        float[2]>(item.get_group());
-    if (tid == 0) {
-      constexpr float kMinScale = 1e-10f;
-      float scale = row_amax / 127.0f;
-      if (scale < kMinScale) scale = kMinScale;
-      sh2[0] = scale;
-      sh2[1] = (row_amax > 0.0f) ? (1.0f / scale) : 0.0f;
-      per_token_scale_[token_idx] = scale;
-    }
-    sycl::group_barrier(item.get_group());
-    float const inv_scale = sh2[1];
-
-    // ================================================================
-    // Pass 3: quantise directly from priv[] — zero global reads
-    // ================================================================
-    pi = 0;
-    if (can_vec) {
-      auto* qout_v = reinterpret_cast<i8x4_t*>(qout_row);
-
-#pragma unroll 4
-      for (int i = tid; i < num_vec; i += wg) {
-        i8x4_t ov;
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          ov.v[j] = quant_one(priv[pi++], inv_scale);
-        }
-        qout_v[i] = ov;
-      }
-    } else {
-      for (int i = tid; i < hidden_size_; i += wg) {
-        qout_row[i] = quant_one(priv[pi++], inv_scale);
-      }
-    }
-  }
-};
+            simd<float, max_block> all_maxvalue = slm_block_load<float, max_block>(quant_offset);
+            float global_maxvalue = hmax<float, float, max_block>(all_maxvalue) / 127.0f;
+            if (block_idx == 0) {
+                block_store<float, 1>(per_token_scale_base, global_maxvalue);
+            }
+            simd<float, block_size> quant = rnde<float>(smooth_input / global_maxvalue);
+            simd<int8_t, block_size> quant_tokens = quant;
+            block_store<int8_t, block_size>(quant_tokens_base, quant_tokens);
+        });
+    });
+}
 
 // ---------- host launcher ----------
 void add_rms_norm_dynamic_quant_forward(
     at::Tensor const& hidden_states,
-    at::Tensor const& residual,       // may be empty (0-dim) when no residual
+    at::Tensor const& residual,
     at::Tensor const& norm_weight,
     at::Tensor const& smooth_scale,
     at::Tensor& quant_out,
@@ -282,9 +140,16 @@ void add_rms_norm_dynamic_quant_forward(
   TORCH_CHECK(
       per_token_scale.scalar_type() == at::kFloat,
       "per_token_scale must be fp32");
+  TORCH_CHECK(
+      hidden_states.scalar_type() == at::kHalf,
+      "kernel requires float16 hidden_states");
 
   int const hidden_size = hidden_states.size(1);
   int const num_tokens = hidden_states.size(0);
+
+  TORCH_CHECK(
+      hidden_size % 256 == 0, "hidden_size must be a multiple of 256");
+  TORCH_CHECK(hidden_size <= 8192, "hidden_size must be <= 8192");
 
   bool const has_residual = residual.numel() > 0;
   if (has_residual) {
@@ -306,65 +171,21 @@ void add_rms_norm_dynamic_quant_forward(
 
   if (num_tokens == 0) return;
 
-  // Each work-item stores at most ceil(hidden_size / wg_size) elements
-  // in a private buffer.  Guard against exceeding the compiled limit.
-  constexpr int kMaxPriv = 16;   // must match MAX_PRIV in kernel
-  int local_size = std::min(hidden_size, 512);
-  if (local_size > 32) {
-    local_size = (local_size / 32) * 32;
-  }
-  int elems_per_wi = (hidden_size + local_size - 1) / local_size;
-  TORCH_CHECK(
-      elems_per_wi <= kMaxPriv,
-      "hidden_size / wg_size exceeds compiled MAX_PRIV (",
-      kMaxPriv, "); got ", elems_per_wi);
-  sycl::range<1> grid(static_cast<size_t>(num_tokens));
-  sycl::range<1> block(static_cast<size_t>(local_size));
-
   auto& queue =
       c10::xpu::getCurrentXPUStream(hidden_states.device().index()).queue();
 
-  float const eps_f = static_cast<float>(eps);
-
-  AT_DISPATCH_SWITCH(
-      hidden_states.scalar_type(),
-      "add_rms_norm_dynamic_quant_sycl_ext",
-      AT_DISPATCH_CASE(at::ScalarType::Half, [&] {
-        auto* res_ptr =
-            has_residual ? residual.data_ptr<scalar_t>() : nullptr;
-        queue.submit([&](sycl::handler& cgh) {
-          auto kernel = add_rms_norm_dynamic_quant_kernel<scalar_t>(
-              quant_out.data_ptr<int8_t>(),
-              per_token_scale.data_ptr<float>(),
-              after_res.data_ptr<scalar_t>(),
-              after_norm.data_ptr<scalar_t>(),
-              hidden_states.data_ptr<scalar_t>(),
-              res_ptr,
-              norm_weight.data_ptr<float>(),
-              smooth_scale.data_ptr<float>(),
-              hidden_size,
-              eps_f);
-          cgh.parallel_for(sycl::nd_range<1>(grid * block, block), kernel);
-        });
-      })
-      AT_DISPATCH_CASE(at::ScalarType::BFloat16, [&] {
-        auto* res_ptr =
-            has_residual ? residual.data_ptr<scalar_t>() : nullptr;
-        queue.submit([&](sycl::handler& cgh) {
-          auto kernel = add_rms_norm_dynamic_quant_kernel<scalar_t>(
-              quant_out.data_ptr<int8_t>(),
-              per_token_scale.data_ptr<float>(),
-              after_res.data_ptr<scalar_t>(),
-              after_norm.data_ptr<scalar_t>(),
-              hidden_states.data_ptr<scalar_t>(),
-              res_ptr,
-              norm_weight.data_ptr<float>(),
-              smooth_scale.data_ptr<float>(),
-              hidden_size,
-              eps_f);
-          cgh.parallel_for(sycl::nd_range<1>(grid * block, block), kernel);
-        });
-      }));
+  add_rms_norm_dynamic_quant_launch(
+      reinterpret_cast<fp16*>(hidden_states.data_ptr()),
+      has_residual ? reinterpret_cast<fp16*>(residual.data_ptr()) : nullptr,
+      norm_weight.data_ptr<float>(),
+      smooth_scale.data_ptr<float>(),
+      reinterpret_cast<fp16*>(after_res.data_ptr()),
+      reinterpret_cast<fp16*>(after_norm.data_ptr()),
+      quant_out.data_ptr<int8_t>(),
+      per_token_scale.data_ptr<float>(),
+      num_tokens, hidden_size, has_residual,
+      static_cast<float>(eps),
+      queue);
 }
 
 }  // namespace
