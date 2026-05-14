@@ -1,5 +1,4 @@
 from functools import partial
-import pathlib
 import torch
 from xpu_perf.micro_perf.core.utils import OpTensorInfo, calc_tensor_size, get_torch_dtype, get_attn_info
 from xpu_perf.micro_perf.core.op import ProviderRegistry
@@ -12,53 +11,71 @@ try:
 except ImportError:
     HAS_TRITON = False
 
-# ── Triton fused dequant kernel ──────────────────────────────────────────────
+# ── Triton fused dequant kernel (K + V in one launch) ───────────────────────
 if HAS_TRITON:
     _DEQUANT_CONFIGS = [
-        triton.Config({}, num_warps=w, num_stages=s)
-        for w in [1, 2, 4, 8]
-        for s in [1, 2, 3]
+        triton.Config({"BLOCK_L": block_l}, num_warps=w, num_stages=s)
+        for block_l in (1,)
+        for w in (1, 2, 4)
+        for s in (1, 2)
     ]
 
-    @triton.autotune(configs=_DEQUANT_CONFIGS, key=['B', 'H', 'L'])
+    @triton.autotune(configs=_DEQUANT_CONFIGS, key=["B", "H", "L", "D"])
     @triton.jit
-    def _fused_dequant_kernel(
-        src_ptr, scale_ptr, dst_ptr,
+    def _fused_dequant_kv_kernel(
+        k_src_ptr, v_src_ptr, k_scale_ptr, v_scale_ptr, k_dst_ptr, v_dst_ptr,
         B, H, L,
         D: tl.constexpr,
         s_src_b, s_src_h, s_src_l, s_src_d,
         s_dst_b, s_dst_h, s_dst_l, s_dst_d,
         BLOCK_D: tl.constexpr,
+        BLOCK_L: tl.constexpr,
     ):
         pid = tl.program_id(0)
-        l_idx = pid % L
-        tmp = pid // L
+        num_l_blocks = tl.cdiv(L, BLOCK_L)
+        l_block = pid % num_l_blocks
+        tmp = pid // num_l_blocks
         h_idx = tmp % H
         b_idx = tmp // H
 
+        l_offs = l_block * BLOCK_L + tl.arange(0, BLOCK_L)
         d_offs = tl.arange(0, BLOCK_D)
-        mask = d_offs < D
+        l_mask = l_offs < L
+        d_mask = d_offs < D
+        mask = l_mask[:, None] & d_mask[None, :]
 
-        scale = tl.load(scale_ptr + h_idx * D + d_offs, mask=mask).to(tl.bfloat16)
-        src_off = b_idx * s_src_b + h_idx * s_src_h + l_idx * s_src_l + d_offs * s_src_d
-        x = tl.load(src_ptr + src_off, mask=mask).to(tl.bfloat16)
+        k_scale = tl.load(k_scale_ptr + h_idx * D + d_offs, mask=d_mask, other=0.0).to(tl.bfloat16)
+        v_scale = tl.load(v_scale_ptr + h_idx * D + d_offs, mask=d_mask, other=0.0).to(tl.bfloat16)
 
-        y = x * scale
+        src_off = (
+            b_idx * s_src_b
+            + h_idx * s_src_h
+            + l_offs[:, None] * s_src_l
+            + d_offs[None, :] * s_src_d
+        )
+        dst_off = (
+            b_idx * s_dst_b
+            + h_idx * s_dst_h
+            + l_offs[:, None] * s_dst_l
+            + d_offs[None, :] * s_dst_d
+        )
 
-        dst_off = b_idx * s_dst_b + h_idx * s_dst_h + l_idx * s_dst_l + d_offs * s_dst_d
-        tl.store(dst_ptr + dst_off, y, mask=mask)
+        k_value = tl.load(k_src_ptr + src_off, mask=mask, other=0.0).to(tl.bfloat16)
+        v_value = tl.load(v_src_ptr + src_off, mask=mask, other=0.0).to(tl.bfloat16)
+        tl.store(k_dst_ptr + dst_off, k_value * k_scale[None, :], mask=mask)
+        tl.store(v_dst_ptr + dst_off, v_value * v_scale[None, :], mask=mask)
 
-    def triton_fused_dequant(src, scale, dst, kv_len):
-        """src: [B,H,max_seq,D] int8, scale: [H,D] bf16, dst: [B,H,max_seq,D] bf16"""
-        B, H = src.shape[0], src.shape[1]
-        D = src.shape[3]
+    def triton_fused_dequant_kv(k_src, v_src, k_scale, v_scale, k_dst, v_dst, kv_len):
+        """k_src/v_src: [B,H,max_seq,D], scales: [H,D] bf16, dsts: bf16."""
+        B, H = k_src.shape[0], k_src.shape[1]
+        D = k_src.shape[3]
         BLOCK_D = triton.next_power_of_2(D)
-        grid = (B * H * kv_len,)
-        _fused_dequant_kernel[grid](
-            src, scale, dst,
+        def grid(meta): return (B * H * triton.cdiv(kv_len, meta["BLOCK_L"]),)
+        _fused_dequant_kv_kernel[grid](
+            k_src, v_src, k_scale, v_scale, k_dst, v_dst,
             B, H, kv_len, D,
-            src.stride(0), src.stride(1), src.stride(2), src.stride(3),
-            dst.stride(0), dst.stride(1), dst.stride(2), dst.stride(3),
+            k_src.stride(0), k_src.stride(1), k_src.stride(2), k_src.stride(3),
+            k_dst.stride(0), k_dst.stride(1), k_dst.stride(2), k_dst.stride(3),
             BLOCK_D=BLOCK_D,
         )
 
@@ -73,6 +90,14 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
 
     def __init__(self, args_dict, backend, *args, **kwargs):
         super().__init__(args_dict, backend, *args, **kwargs)
+
+    def _can_use_linear_batch_vectorization(self):
+        uniform_kv_lens = all(b_kv_len == self.kv_lens[0] for b_kv_len in self.kv_lens)
+        identity_slots = all(slot == batch_idx for batch_idx, slot in enumerate(self.slot_mapping))
+        return uniform_kv_lens and identity_slots
+
+    def _can_use_triton_linear_dequant(self):
+        return HAS_TRITON and self.dtype in ["int8", "float8"] and self._can_use_linear_batch_vectorization()
 
     def prepare(self):
         self.arg_type = self.args_dict["arg_type"]
@@ -120,13 +145,13 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 shape=self.quant_scale_shape,
                 dtype=torch.float32,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.ones,
+                creator=torch.empty,
             ),
             "v_scale": OpTensorInfo(
                 shape=self.quant_scale_shape,
                 dtype=torch.float32,
                 device=self.backend.get_torch_device_name(),
-                creator=torch.ones,
+                creator=torch.empty,
             ),
         }
         self.output_tensor_info = {}
@@ -144,11 +169,13 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
+                creator=torch.empty,
             )
             self.input_tensor_info["v_cache"] = OpTensorInfo(
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
+                creator=torch.empty,
             )
             self.output_tensor_info["dequant_k_cache"] = OpTensorInfo(
                 shape=[self.batch_size, self.kv_head_num, self.max_kv_len, self.head_dim],
@@ -176,11 +203,13 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
                 shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
+                creator=torch.empty,
             )
             self.input_tensor_info["v_cache"] = OpTensorInfo(
                 shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
                 dtype=self.torch_dtype,
                 device=self.backend.get_torch_device_name(),
+                creator=torch.empty,
             )
             self.output_tensor_info["dequant_k_cache"] = OpTensorInfo(
                 shape=[self.total_cache_blocks, self.kv_head_num, self.block_size, self.head_dim],
@@ -309,12 +338,16 @@ class DequantKVCacheOp(BaseDequantKVCacheOp):
             kv_len = self.kv_lens[0]
             uniform_kv_lens = all(b_kv_len == kv_len for b_kv_len in self.kv_lens)
 
-            if HAS_TRITON and self.kv_head_num > 4 and uniform_kv_lens:
+            if self._can_use_triton_linear_dequant():
                 k_scale_bf16 = k_scale.to(self.dst_torch_dtype)
                 v_scale_bf16 = v_scale.to(self.dst_torch_dtype)
-                triton_fused_dequant(k_cache, k_scale_bf16, dequant_k_cache, kv_len)
-                triton_fused_dequant(v_cache, v_scale_bf16, dequant_v_cache, kv_len)
-            elif uniform_kv_lens:
+                triton_fused_dequant_kv(
+                    k_cache, v_cache,
+                    k_scale_bf16, v_scale_bf16,
+                    dequant_k_cache, dequant_v_cache,
+                    kv_len,
+                )
+            elif uniform_kv_lens and self._can_use_linear_batch_vectorization():
                 if self.batch_size <= 4:
                     # Vectorized: good for small batch
                     src_k = k_cache[:, :, :kv_len, :].to(self.dst_torch_dtype)
