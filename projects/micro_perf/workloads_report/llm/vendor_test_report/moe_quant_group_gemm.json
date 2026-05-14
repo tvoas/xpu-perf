@@ -1,0 +1,20 @@
+{
+    "moe_quant_group_gemm": [
+        {
+            "arg_type": "llm",
+            "dtype.w_dtype.compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16"],
+                ["int8", "int8", "int8", "bfloat16"],
+                ["float8", "float8", "float8", "bfloat16"],
+                ["mxfloat8", "mxfloat8", "mxfloat8", "bfloat16"],
+                ["mxfloat4", "mxfloat4", "mxfloat4", "bfloat16"]
+            ],
+            "ep_size": [4, 8],
+            "num_experts.topk.hidden_size.new_hidden_size": [
+                [128, 8, 4096, 3072],
+                [128, 8, 1536, 4096]
+            ],
+            "num_tokens": [1, 4, 16, 64, 192, 384, 896, 1024, 1792, 4096, 5120, 10240, 32768]
+        }
+    ]
+}

@@ -36,6 +36,13 @@
             "add_residual": [true, false],
             "hidden_size": [7168],
             "num_tokens": [40, 80, 4096]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "sp_size": [4, 8],
+            "hidden_size": [4096],
+            "num_tokens": [16, 64, 192, 384, 896, 1024, 1792, 4096, 5120, 10240, 32768]
         }
     ],
     "add_rms_norm_dynamic_quant": [
@@ -53,8 +60,8 @@
             "arg_type": "llm",
             "dtype": "bfloat16",
             "dst_dtype": ["int8", "float8"],
-            "hidden_size": [1024, 4096, 7168],
-            "num_tokens": [40, 80, 4096]
+            "hidden_size": [1024, 2048, 4096, 7168],
+            "num_tokens": [16, 64, 192, 384, 896, 1024, 1792, 4096, 5120, 10240, 32768]
         }
     ],
     "swiglu_dynamic_quant": [
@@ -62,8 +69,25 @@
             "arg_type": "llm",
             "dtype": "bfloat16",
             "dst_dtype": ["int8", "float8"],
-            "hidden_size": [3200, 7168],
-            "num_tokens": [40, 80, 4096]
+            "hidden_size": [3200, 6400, 6912, 7168, 12800, 13824, 25600, 27648],
+            "num_tokens": [16, 64, 192, 384, 896, 1024, 1792, 4096, 5120, 10240, 32768]
+        }
+    ],
+    "qk_rms_norm": [
+        {
+            "arg_type": "llm",
+            "dtype": "bfloat16",
+            "q_head_num.kv_head_num.qk_head_dim.v_head_dim": [
+                [64, 8, 128, 128],
+                [80, 8, 128, 128],
+                [32, 4, 128, 128],
+                [40, 4, 128, 128],
+                [16, 2, 128, 128],
+                [20, 2, 128, 128],
+                [8, 1, 128, 128],
+                [16, 1, 128, 128]
+            ],
+            "num_tokens": [16, 64, 192, 384, 896, 1024, 1792, 4096, 5120, 10240, 32768]
         }
     ]
 }

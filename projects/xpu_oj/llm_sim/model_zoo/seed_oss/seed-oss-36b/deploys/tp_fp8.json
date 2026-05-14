@@ -22,7 +22,7 @@
         }
     }, 
     "parallel_config": {
-        "device_num": 8, 
+        "device_num": 8,
         "tp_size": 8
     }, 
     "extra_config": {}, 

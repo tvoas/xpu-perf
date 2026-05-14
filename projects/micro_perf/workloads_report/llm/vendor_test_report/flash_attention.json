@@ -1,0 +1,85 @@
+{
+    "flash_attention": [
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype.cache_dtype.qk_compute_dtype.pv_compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "int8", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "float8", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "mxfloat8", "bfloat16", "bfloat16", "bfloat16"],
+                ["int8", "int8", "int8", "int8", "bfloat16"],
+                ["float8", "float8", "float8", "float8", "bfloat16"],
+                ["mxfloat8", "mxfloat8", "mxfloat8", "mxfloat8", "bfloat16"]
+            ],
+            "q_head_num.kv_head_num.head_dim": [
+                [64, 8, 128],
+                [80, 8, 128],
+                [32, 4, 128],
+                [40, 4, 128],
+                [16, 2, 128],
+                [20, 2, 128],
+                [8, 1, 128],
+                [16, 1, 128]
+            ],
+            "block_size": 512,
+            "batch_size": 1,
+            "cache_len": 0,
+            "q_len": [384, 1024, 1792, 4096, 10240, 32768]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype.cache_dtype.qk_compute_dtype.pv_compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "int8", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "float8", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "mxfloat8", "bfloat16", "bfloat16", "bfloat16"],
+                ["int8", "int8", "int8", "int8", "bfloat16"],
+                ["float8", "float8", "float8", "float8", "bfloat16"],
+                ["mxfloat8", "mxfloat8", "mxfloat8", "mxfloat8", "bfloat16"]
+            ],
+            "q_head_num.kv_head_num.head_dim": [
+                [64, 8, 128],
+                [80, 8, 128],
+                [32, 4, 128],
+                [40, 4, 128],
+                [16, 2, 128],
+                [20, 2, 128],
+                [8, 1, 128],
+                [16, 1, 128]
+            ],
+            "block_size": 512,
+            "batch_size": 1,
+            "cache_len": [192, 896, 5120],
+            "q_len": [192, 896, 4096, 5120]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "decode",
+            "dtype.cache_dtype.qk_compute_dtype.pv_compute_dtype.dst_dtype": [
+                ["bfloat16", "bfloat16", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "int8", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "float8", "bfloat16", "bfloat16", "bfloat16"],
+                ["bfloat16", "mxfloat8", "bfloat16", "bfloat16", "bfloat16"],
+                ["int8", "int8", "int8", "int8", "bfloat16"],
+                ["float8", "float8", "float8", "float8", "bfloat16"],
+                ["mxfloat8", "mxfloat8", "mxfloat8", "mxfloat8", "bfloat16"]
+            ],
+            "q_head_num.kv_head_num.head_dim": [
+                [64, 8, 128],
+                [80, 8, 128],
+                [32, 4, 128],
+                [40, 4, 128],
+                [16, 2, 128],
+                [20, 2, 128],
+                [8, 1, 128],
+                [16, 1, 128]
+            ],
+            "block_size": 512,
+            "batch_size": [16],
+            "cache_len": [384, 1792, 10240],
+            "q_len": [1, 4]
+        }
+    ]
+}

@@ -1,7 +1,7 @@
 {
     "base_model_name": "qwen3_moe", 
     "model_name": "qwen3-235b-a22b", 
-    "infer_dtype": "gemm{w8a8_fp8}_fa{c8_fp8}", 
+    "infer_dtype": "gemm{w8a8_fp8}_fa{c8_fp8}",
     "dtype_config": {
         "default_dtype": "bfloat16", 
         "qkvo": {
