@@ -45,6 +45,9 @@ SYCL_TLA_RUNTIME_PATHS=(-Wl,-rpath,/lib64/stubs -Wl,-rpath,"$MKLROOT/lib" -Wl,-r
 BMG_09_LINK_FLAGS=(-Xs "-options \"-igc_opts 'VectorAliasBBThreshold=10000'\"")
 BMG_10_LINK_FLAGS=(-Xs "-options \"-igc_opts 'allowDecompose2DBlockFuncs=0'\"")
 
+DNNL_INCLUDE="${DNNLROOT:-/opt/intel/oneapi/dnnl/latest}/include"
+DNNL_LIB_DIR="${DNNLROOT:-/opt/intel/oneapi/dnnl/latest}/lib"
+
 # Auto-detect BMG device target: bmg-g21 (B580/B570) or bmg-g31 (B770/B740)
 # Override with: BMG_DEVICE=bmg-g21 bash build.sh
 if [[ -z "${BMG_DEVICE:-}" ]]; then
@@ -288,6 +291,20 @@ icpx -shared -fPIC -O3 -DNDEBUG -std=c++17 \
     -o quant_matmul_sycl.so \
     $SYCL_TLA_LINK_LIBS
 
+# --- oneDNN provider extension ---
+# Reference: ops/onednn/build.sh
+build_async quant_matmul_onednn \
+icpx -fsycl -shared -fPIC -O2 -std=c++17 \
+    -DTORCH_EXTENSION_NAME=quant_matmul_onednn \
+    -I"$PYTHON_INCLUDE" \
+    $TORCH_INCLUDES \
+    -I"$DNNL_INCLUDE" \
+    ../onednn/quant_matmul_onednn.cpp \
+    -o ../onednn/quant_matmul_onednn.so \
+    $TORCH_LIBS -ltorch -ltorch_python -lc10 \
+    -L"$DNNL_LIB_DIR" -ldnnl \
+    -Wl,-rpath,"$DNNL_LIB_DIR"
+
 # --- Wait for all builds ---
 echo ""
 echo "Waiting for ${#PIDS[@]} parallel builds..."
@@ -310,3 +327,4 @@ rm -rf "$LOG_DIR"
 echo ""
 echo "All builds successful:"
 ls -la "$SCRIPT_DIR"/*.so
+ls -la ../onednn/*.so
