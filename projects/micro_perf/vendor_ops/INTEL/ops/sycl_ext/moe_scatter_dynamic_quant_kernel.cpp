@@ -12,6 +12,25 @@ using namespace sycl::ext::intel::esimd;
 using bf16 = sycl::ext::oneapi::bfloat16;
 using fp16 = sycl::half;
 
+/*
+ * MoE scatter + per-token dynamic quantization.
+ *
+ * Contract:
+ *   - selected_experts / moe_weights are shaped [num_tokens, topk].
+ *   - The kernel itself produces routing workspaces:
+ *       token_to_scatter_offset, experts_token_count, experts_token_start.
+ *   - hidden_states and experts_smooth_scale are then fused with the routing
+ *     metadata to produce scatter_tokens, per-token scales, and source-token ids.
+ *
+ * Execution outline:
+ *   1. A lightweight routing kernel builds per-expert counts and per-token
+ *      offsets in dispatch order.
+ *   2. The ESIMD kernel gathers each token/expert pair, applies expert smooth
+ *      scale and moe weight, computes the row max, and quantizes the row.
+ *   3. Outputs are written in expert-grouped scatter order together with the
+ *      source token index for each scattered row.
+ */
+
 template <typename decl_tag> struct QuantMax;
 template <> struct QuantMax<int8_t> { static constexpr float value = 127.0f; };
 template <> struct QuantMax<uint8_t> { static constexpr float value = 448.0f; }; // e4m3fn max value
@@ -241,6 +260,8 @@ void moe_scatter_dynamic_quant_impl(
 
     int total_scatter_items = n_tokens * topk;
 
+    // Small problems can under-utilize wide unroll factors. Keep enough total
+    // threads in flight before selecting a more aggressive launch shape.
     int target_total_threads = 1024;
 
     auto is_valid_unroll = [&](int unroll) {
@@ -249,6 +270,7 @@ void moe_scatter_dynamic_quant_impl(
         return (hd_size % bs == 0) && ((total_scatter_items * max_wg_size) >= target_total_threads);
     };
 
+    // Prefer the widest clean unroll that still exposes enough parallel work.
     if (is_valid_unroll(32)) return launch_scatter(std::integral_constant<int, 32>{});
     if (is_valid_unroll(16)) return launch_scatter(std::integral_constant<int, 16>{});
     if (is_valid_unroll(8))  return launch_scatter(std::integral_constant<int, 8>{});
