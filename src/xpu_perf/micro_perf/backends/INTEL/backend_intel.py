@@ -245,7 +245,11 @@ class BackendINTEL(Backend):
         """Override base xccl_infer_loop() to sort batch by world_size
         descending, avoiding CCL communicator resource deadlock on
         Intel XE GPUs (PCIe topology, no XeLink)."""
-        _load_xccl()
+        # Worker plugin discovery happens in load_all_ops(); ensure it runs
+        # before lazy-importing vendor XCCL helpers.
+        if run_infer_loop is None:
+            self.load_all_ops()
+            _load_xccl()
         if run_infer_loop is not None:
             return run_infer_loop(
                 self, local_process_rank, process_mapping,
