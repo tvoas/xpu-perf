@@ -3,6 +3,7 @@ from xpu_perf.micro_perf.core.utils import static_quant
 
 from xpu_perf.micro_perf.core.op import ProviderRegistry
 BaseStoreKVCacheOp = ProviderRegistry.BASE_IMPL_MAPPING["store_kv_cache"]
+_FLOAT8_E4M3_DTYPE = getattr(torch, "float8_e4m3fn", None)
 
 try:
     import triton
@@ -40,6 +41,7 @@ if HAS_TRITON:
         max_val: tl.constexpr,
         BLOCK_D: tl.constexpr,
         BLOCK_L: tl.constexpr,
+        IS_FP8: tl.constexpr = False,
     ):
         batch_idx = tl.program_id(0)
         head_idx = tl.program_id(1)
@@ -65,28 +67,30 @@ if HAS_TRITON:
         k_quant = tl.minimum(tl.maximum(k_value * k_scale[None, :], -max_val), max_val)
         v_quant = tl.minimum(tl.maximum(v_value * v_scale[None, :], -max_val), max_val)
 
-        k_floor = tl.floor(k_quant)
-        v_floor = tl.floor(v_quant)
-        k_round = tl.floor(k_quant + 0.5)
-        v_round = tl.floor(v_quant + 0.5)
-        k_tie = (k_quant - k_floor) == 0.5
-        v_tie = (v_quant - v_floor) == 0.5
-        k_round_i = k_round.to(tl.int32)
-        v_round_i = v_round.to(tl.int32)
-        k_round = tl.where(k_tie & ((k_round_i % 2) != 0), k_round - 1.0, k_round)
-        v_round = tl.where(v_tie & ((v_round_i % 2) != 0), v_round - 1.0, v_round)
+        if not IS_FP8:
+            k_floor = tl.floor(k_quant)
+            v_floor = tl.floor(v_quant)
+            k_round = tl.floor(k_quant + 0.5)
+            v_round = tl.floor(v_quant + 0.5)
+            k_tie = (k_quant - k_floor) == 0.5
+            v_tie = (v_quant - v_floor) == 0.5
+            k_round_i = k_round.to(tl.int32)
+            v_round_i = v_round.to(tl.int32)
+            k_quant = tl.where(k_tie & ((k_round_i % 2) != 0), k_round - 1.0, k_round).to(tl.int8)
+            v_quant = tl.where(v_tie & ((v_round_i % 2) != 0), v_round - 1.0, v_round).to(tl.int8)
 
         l_dst = cache_len_off + l_offs
         dst = batch_idx * c_b + head_idx * c_h + l_dst[:, None] * c_l + d_offs[None, :] * c_d
-        tl.store(k_cache_ptr + dst, k_round.to(tl.int8), mask=mask)
-        tl.store(v_cache_ptr + dst, v_round.to(tl.int8), mask=mask)
+        tl.store(k_cache_ptr + dst, k_quant, mask=mask)
+        tl.store(v_cache_ptr + dst, v_quant, mask=mask)
 
     def triton_fused_quant_store_kv(
         packed_qkv, k_scale, v_scale, k_cache, v_cache,
         batch_size, kv_head_num, q_len, head_dim,
-        k_head_start, v_head_start, cache_len,
+        k_head_start, v_head_start, cache_len, is_fp8=False,
     ):
         BLOCK_D = triton.next_power_of_2(head_dim)
+        max_val = 448.0 if is_fp8 else 127.0
         def grid(meta): return (batch_size, kv_head_num, triton.cdiv(q_len, meta["BLOCK_L"]))
         _fused_quant_store_kv_kernel[grid](
             packed_qkv, k_scale, v_scale, k_cache, v_cache,
@@ -94,8 +98,9 @@ if HAS_TRITON:
             cache_len, k_head_start, v_head_start,
             packed_qkv.stride(0), packed_qkv.stride(1), packed_qkv.stride(2),
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2), k_cache.stride(3),
-            max_val=127.0,
+            max_val=max_val,
             BLOCK_D=BLOCK_D,
+            IS_FP8=is_fp8,
         )
 
     @triton.autotune(configs=_SINGLE_STORE_CONFIGS, key=["B", "H", "D", "Q", "HEAD_OFF"])
@@ -113,6 +118,7 @@ if HAS_TRITON:
         BLOCK_D: tl.constexpr,
         BLOCK_L: tl.constexpr,
         DO_QUANT: tl.constexpr,
+        IS_FP8: tl.constexpr = False,
     ):
         batch_idx = tl.program_id(0)
         head_idx = tl.program_id(1)
@@ -131,11 +137,12 @@ if HAS_TRITON:
         if DO_QUANT:
             scale = tl.load(scale_ptr + head_idx * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
             value = tl.minimum(tl.maximum(value * scale[None, :], -max_val), max_val)
-            value_floor = tl.floor(value)
-            value_round = tl.floor(value + 0.5)
-            value_tie = (value - value_floor) == 0.5
-            value_round_i = value_round.to(tl.int32)
-            value = tl.where(value_tie & ((value_round_i % 2) != 0), value_round - 1.0, value_round).to(tl.int8)
+            if not IS_FP8:
+                value_floor = tl.floor(value)
+                value_round = tl.floor(value + 0.5)
+                value_tie = (value - value_floor) == 0.5
+                value_round_i = value_round.to(tl.int32)
+                value = tl.where(value_tie & ((value_round_i % 2) != 0), value_round - 1.0, value_round).to(tl.int8)
 
         l_dst = cache_len_off + l_offs
         dst = batch_idx * c_b + head_idx * c_h + l_dst[:, None] * c_l + d_offs[None, :] * c_d
@@ -144,10 +151,11 @@ if HAS_TRITON:
     def triton_single_linear_store(
         packed_qkv, scale, cache,
         batch_size, kv_head_num, q_len, head_dim,
-        head_start, cache_len, do_quant,
+        head_start, cache_len, do_quant, is_fp8=False,
     ):
         BLOCK_D = triton.next_power_of_2(head_dim)
         scale_arg = scale if scale is not None else cache
+        max_val = 448.0 if is_fp8 else 127.0
         def grid(meta): return (batch_size, kv_head_num, triton.cdiv(q_len, meta["BLOCK_L"]))
         _single_linear_store_kernel[grid](
             packed_qkv, scale_arg, cache,
@@ -155,9 +163,10 @@ if HAS_TRITON:
             cache_len, head_start,
             packed_qkv.stride(0), packed_qkv.stride(1), packed_qkv.stride(2),
             cache.stride(0), cache.stride(1), cache.stride(2), cache.stride(3),
-            max_val=127.0,
+            max_val=max_val,
             BLOCK_D=BLOCK_D,
             DO_QUANT=do_quant,
+            IS_FP8=is_fp8,
         )
 
     @triton.autotune(configs=_SINGLE_STORE_CONFIGS, key=["B", "H", "D", "MAX_Q", "BLOCK_SIZE", "HEAD_OFF"])
@@ -178,6 +187,7 @@ if HAS_TRITON:
         BLOCK_D: tl.constexpr,
         BLOCK_L: tl.constexpr,
         DO_QUANT: tl.constexpr,
+        IS_FP8: tl.constexpr = False,
     ):
         batch_idx = tl.program_id(0)
         head_idx = tl.program_id(1)
@@ -199,11 +209,12 @@ if HAS_TRITON:
         if DO_QUANT:
             scale = tl.load(scale_ptr + head_idx * D + d_offs, mask=d_mask, other=0.0).to(tl.float32)
             value = tl.minimum(tl.maximum(value * scale[None, :], -max_val), max_val)
-            value_floor = tl.floor(value)
-            value_round = tl.floor(value + 0.5)
-            value_tie = (value - value_floor) == 0.5
-            value_round_i = value_round.to(tl.int32)
-            value = tl.where(value_tie & ((value_round_i % 2) != 0), value_round - 1.0, value_round).to(tl.int8)
+            if not IS_FP8:
+                value_floor = tl.floor(value)
+                value_round = tl.floor(value + 0.5)
+                value_tie = (value - value_floor) == 0.5
+                value_round_i = value_round.to(tl.int32)
+                value = tl.where(value_tie & ((value_round_i % 2) != 0), value_round - 1.0, value_round).to(tl.int8)
 
         position = cache_len + l_offs
         block_idx = position // BLOCK_SIZE
@@ -217,10 +228,11 @@ if HAS_TRITON:
         packed_qkv, scale, cache,
         block_table, q_lens, cache_lens, accum_q_lens,
         batch_size, kv_head_num, max_q_len, head_dim, block_size,
-        head_start, paged_cache_layout, do_quant,
+        head_start, paged_cache_layout, do_quant, is_fp8=False,
     ):
         BLOCK_D = triton.next_power_of_2(head_dim)
         scale_arg = scale if scale is not None else cache
+        max_val = 448.0 if is_fp8 else 127.0
         if paged_cache_layout == "head_major":
             c_b, c_h, c_l, c_d = cache.stride()
         else:
@@ -238,9 +250,10 @@ if HAS_TRITON:
             packed_qkv.stride(0), packed_qkv.stride(1), packed_qkv.stride(2),
             block_table.stride(0), block_table.stride(1),
             c_b, c_h, c_l, c_d,
-            max_val=127.0,
+            max_val=max_val,
             BLOCK_D=BLOCK_D,
             DO_QUANT=do_quant,
+            IS_FP8=is_fp8,
         )
 
 
@@ -253,6 +266,13 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
         self.paged_cache_layout = self.args_dict.get("paged_cache_layout", "head_major")
         if self.paged_cache_layout not in ("head_major", "offset_major"):
             raise ValueError("paged_cache_layout must be either head_major or offset_major")
+
+    def vendor_parser(self):
+        """Extend base parser to accept float8/float8_e4m3 cache_dtype."""
+        if self.dtype == "bfloat16" and self.cache_dtype in ("float8", "float8_e4m3"):
+            self.use_quant = True
+        else:
+            super().vendor_parser()
 
     def vendor_impl(self):
         super().vendor_impl()
@@ -282,12 +302,25 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
         identity_slots = all(slot == batch_idx for batch_idx, slot in enumerate(self.slot_mapping))
         return uniform_lens and identity_slots
 
+    def _is_fp8_cache_dtype(self):
+        return _FLOAT8_E4M3_DTYPE is not None and self.cache_torch_dtype == _FLOAT8_E4M3_DTYPE
+
+    def _is_supported_quant_cache_dtype(self):
+        return self.cache_torch_dtype == torch.int8 or self._is_fp8_cache_dtype()
+
+    def _quant_max_val(self):
+        if self.cache_torch_dtype == torch.int8:
+            return 127.0
+        if self._is_fp8_cache_dtype():
+            return 448.0
+        raise ValueError(f"Unsupported cache dtype: {self.cache_torch_dtype}")
+
     def _can_use_triton_linear_quant_store(self, k_cache, v_cache, k_scale, v_scale):
         return (
             HAS_TRITON
             and self.cache_type == "linear"
             and self.use_quant
-            and self.cache_torch_dtype == torch.int8
+            and self._is_supported_quant_cache_dtype()
             and k_cache is not None
             and v_cache is not None
             and k_scale is not None
@@ -301,7 +334,7 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
             and cache is not None
             and (
                 (not self.use_quant and self.cache_torch_dtype == torch.bfloat16)
-                or (self.use_quant and self.cache_torch_dtype == torch.int8 and scale is not None)
+                or (self.use_quant and self._is_supported_quant_cache_dtype() and scale is not None)
             )
         )
 
@@ -329,6 +362,7 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
                     packed_qkv, k_scale, v_scale, k_cache, v_cache,
                     self.batch_size, self.kv_head_num, q_len, self.head_dim,
                     k_head_start, v_head_start, cache_len,
+                    is_fp8=self._is_fp8_cache_dtype(),
                 )
                 return k_cache, v_cache
 
@@ -339,6 +373,7 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
                         packed_qkv, k_scale, k_cache,
                         self.batch_size, self.kv_head_num, q_len, self.head_dim,
                         k_head_start, cache_len, self.use_quant,
+                        is_fp8=self._is_fp8_cache_dtype(),
                     )
                     used_triton = True
                 if self._can_use_triton_single_store(v_cache, v_scale):
@@ -346,6 +381,7 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
                         packed_qkv, v_scale, v_cache,
                         self.batch_size, self.kv_head_num, q_len, self.head_dim,
                         v_head_start, cache_len, self.use_quant,
+                        is_fp8=self._is_fp8_cache_dtype(),
                     )
                     used_triton = True
                 if used_triton:
@@ -364,10 +400,7 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
             if self.use_quant:
                 scale_k = k_scale.view(1, self.kv_head_num, 1, self.head_dim) if k_scale is not None else None
                 scale_v = v_scale.view(1, self.kv_head_num, 1, self.head_dim) if v_scale is not None else None
-                if self.cache_torch_dtype == torch.int8:
-                    max_val = 127.0
-                else:
-                    raise ValueError(f"Unsupported cache dtype: {self.cache_torch_dtype}")
+                max_val = self._quant_max_val()
                 if k_cache is not None:
                     if scale_k is None:
                         raise ValueError("k_scale is required when storing quantized k_cache")
@@ -437,6 +470,7 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
                 tensor_mapping["cache_lens"], tensor_mapping["accum_q_lens"],
                 self.batch_size, self.kv_head_num, self.max_q_len, self.head_dim, self.block_size,
                 k_head_start, self.paged_cache_layout, self.use_quant,
+                is_fp8=self._is_fp8_cache_dtype(),
             )
             used_triton = True
         if self._can_use_triton_single_store(v_cache, v_scale):
@@ -446,6 +480,7 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
                 tensor_mapping["cache_lens"], tensor_mapping["accum_q_lens"],
                 self.batch_size, self.kv_head_num, self.max_q_len, self.head_dim, self.block_size,
                 v_head_start, self.paged_cache_layout, self.use_quant,
+                is_fp8=self._is_fp8_cache_dtype(),
             )
             used_triton = True
         if used_triton:
@@ -472,14 +507,14 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
         if self.use_quant:
             scale_k = k_scale.view(1, self.kv_head_num, self.head_dim) if k_scale is not None else None
             scale_v = v_scale.view(1, self.kv_head_num, self.head_dim) if v_scale is not None else None
-            if self.cache_torch_dtype == torch.int8:
-                max_val = 127.0
-            else:
-                raise ValueError(f"Unsupported cache dtype: {self.cache_torch_dtype}")
+            max_val = self._quant_max_val()
             if k_cache is not None:
                 if scale_k is None:
                     raise ValueError("k_scale is required when storing quantized k_cache")
-                k_q = src_k.float().mul(scale_k).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
+                k_q = src_k.float().mul(scale_k).clamp_(-max_val, max_val)
+                if self.cache_torch_dtype == torch.int8:
+                    k_q = k_q.round_()
+                k_q = k_q.to(self.cache_torch_dtype)
                 if self.paged_cache_layout == "head_major":
                     k_cache[phys, :, offsets, :] = k_q
                 else:
@@ -487,7 +522,10 @@ class StoreKVCacheOp(BaseStoreKVCacheOp):
             if v_cache is not None:
                 if scale_v is None:
                     raise ValueError("v_scale is required when storing quantized v_cache")
-                v_q = src_v.float().mul(scale_v).clamp_(-max_val, max_val).round_().to(self.cache_torch_dtype)
+                v_q = src_v.float().mul(scale_v).clamp_(-max_val, max_val)
+                if self.cache_torch_dtype == torch.int8:
+                    v_q = v_q.round_()
+                v_q = v_q.to(self.cache_torch_dtype)
                 if self.paged_cache_layout == "head_major":
                     v_cache[phys, :, offsets, :] = v_q
                 else:
