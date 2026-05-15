@@ -29,6 +29,7 @@ try:
         def __init__(self, args_dict, backend, *args, **kwargs):
             super().__init__(args_dict, backend, *args, **kwargs)
             self.extra_providers = ["sycl_ext"]
+            self.paged_cache_layout = args_dict.get("paged_cache_layout", "head_major")
 
         def vendor_parser(self):
             """Extend base parser to accept float8/float8_e4m3 cache_dtype."""
@@ -75,8 +76,8 @@ try:
             identity_slots = self.cache_type != "linear" or \
                 all(slot == batch_idx for batch_idx, slot in enumerate(self.slot_mapping))
 
-            # SYCL kernel requires both K and V caches, and uniform lens
-            if k_cache is None or v_cache is None or not uniform_lens or not identity_slots:
+            # SYCL fast path supports uniform lens and identity linear slots.
+            if not uniform_lens or not identity_slots:
                 packed_qkv_3d = packed_qkv.view(-1, self.total_head_num, self.head_dim)
                 v_head_start = k_head_start + self.kv_head_num
 
@@ -103,16 +104,28 @@ try:
 
                     if self.use_quant:
                         if k_cache is not None:
-                            k_cache[phys, :, offsets, :] = static_quant(
-                                src_k, tensor_mapping["k_scale"], self.cache_torch_dtype)
+                            k_q = static_quant(src_k, tensor_mapping["k_scale"], self.cache_torch_dtype)
+                            if self.paged_cache_layout == "head_major":
+                                k_cache[phys, :, offsets, :] = k_q
+                            else:
+                                k_cache[phys, offsets, :, :] = k_q
                         if v_cache is not None:
-                            v_cache[phys, :, offsets, :] = static_quant(
-                                src_v, tensor_mapping["v_scale"], self.cache_torch_dtype)
+                            v_q = static_quant(src_v, tensor_mapping["v_scale"], self.cache_torch_dtype)
+                            if self.paged_cache_layout == "head_major":
+                                v_cache[phys, :, offsets, :] = v_q
+                            else:
+                                v_cache[phys, offsets, :, :] = v_q
                     else:
                         if k_cache is not None:
-                            k_cache[phys, :, offsets, :] = src_k.to(self.cache_torch_dtype)
+                            if self.paged_cache_layout == "head_major":
+                                k_cache[phys, :, offsets, :] = src_k.to(self.cache_torch_dtype)
+                            else:
+                                k_cache[phys, offsets, :, :] = src_k.to(self.cache_torch_dtype)
                         if v_cache is not None:
-                            v_cache[phys, :, offsets, :] = src_v.to(self.cache_torch_dtype)
+                            if self.paged_cache_layout == "head_major":
+                                v_cache[phys, :, offsets, :] = src_v.to(self.cache_torch_dtype)
+                            else:
+                                v_cache[phys, offsets, :, :] = src_v.to(self.cache_torch_dtype)
                 else:
                     # Linear non-uniform/non-identity: per-batch slice copy
                     for batch_idx in range(bs):
@@ -144,53 +157,130 @@ try:
 
             if self.cache_type == "paged":
                 block_table = tensor_mapping["block_table"]
+                offset_major = self.paged_cache_layout == "offset_major"
                 if self.use_quant:
                     if self.cache_dtype in ("float8", "float8_e4m3"):
-                        _sycl_ext.store_kv_cache_fp8_paged(
-                            packed_qkv, k_cache, v_cache,
-                            tensor_mapping["k_scale"], tensor_mapping["v_scale"],
-                            block_table,
-                            k_head_start, self.kv_head_num,
-                            bs, q_len, cache_len)
+                        if self.store_mode == "both":
+                            _sycl_ext.store_kv_cache_fp8_paged(
+                                packed_qkv, k_cache, v_cache,
+                                tensor_mapping["k_scale"], tensor_mapping["v_scale"],
+                                block_table,
+                                k_head_start, self.kv_head_num,
+                                bs, q_len, cache_len, offset_major)
+                        elif self.store_mode == "k":
+                            _sycl_ext.store_kv_cache_fp8_single_paged(
+                                packed_qkv, k_cache, tensor_mapping["k_scale"],
+                                block_table,
+                                k_head_start, self.kv_head_num,
+                                bs, q_len, cache_len, offset_major)
+                        else:
+                            _sycl_ext.store_kv_cache_fp8_single_paged(
+                                packed_qkv, v_cache, tensor_mapping["v_scale"],
+                                block_table,
+                                k_head_start + self.kv_head_num, self.kv_head_num,
+                                bs, q_len, cache_len, offset_major)
                     else:
-                        _sycl_ext.store_kv_cache_int8_paged(
+                        if self.store_mode == "both":
+                            _sycl_ext.store_kv_cache_int8_paged(
+                                packed_qkv, k_cache, v_cache,
+                                tensor_mapping["k_scale"], tensor_mapping["v_scale"],
+                                block_table,
+                                k_head_start, self.kv_head_num,
+                                bs, q_len, cache_len, offset_major)
+                        elif self.store_mode == "k":
+                            _sycl_ext.store_kv_cache_int8_single_paged(
+                                packed_qkv, k_cache, tensor_mapping["k_scale"],
+                                block_table,
+                                k_head_start, self.kv_head_num,
+                                bs, q_len, cache_len, offset_major)
+                        else:
+                            _sycl_ext.store_kv_cache_int8_single_paged(
+                                packed_qkv, v_cache, tensor_mapping["v_scale"],
+                                block_table,
+                                k_head_start + self.kv_head_num, self.kv_head_num,
+                                bs, q_len, cache_len, offset_major)
+                else:
+                    if self.store_mode == "both":
+                        _sycl_ext.store_kv_cache_bf16_paged(
                             packed_qkv, k_cache, v_cache,
-                            tensor_mapping["k_scale"], tensor_mapping["v_scale"],
                             block_table,
                             k_head_start, self.kv_head_num,
-                            bs, q_len, cache_len)
-                else:
-                    _sycl_ext.store_kv_cache_bf16_paged(
-                        packed_qkv, k_cache, v_cache,
-                        block_table,
-                        k_head_start, self.kv_head_num,
-                        bs, q_len, cache_len)
+                            bs, q_len, cache_len, offset_major)
+                    elif self.store_mode == "k":
+                        _sycl_ext.store_kv_cache_bf16_single_paged(
+                            packed_qkv, k_cache,
+                            block_table,
+                            k_head_start, self.kv_head_num,
+                            bs, q_len, cache_len, offset_major)
+                    else:
+                        _sycl_ext.store_kv_cache_bf16_single_paged(
+                            packed_qkv, v_cache,
+                            block_table,
+                            k_head_start + self.kv_head_num, self.kv_head_num,
+                            bs, q_len, cache_len, offset_major)
                 return k_cache, v_cache
 
             # Linear path: identity slots, uniform lens
             if self.use_quant:
-                k_scale = tensor_mapping["k_scale"]
-                v_scale = tensor_mapping["v_scale"]
                 if self.cache_dtype in ("float8", "float8_e4m3"):
-                    _sycl_ext.store_kv_cache_fp8(
+                    if self.store_mode == "both":
+                        _sycl_ext.store_kv_cache_fp8(
+                            packed_qkv, k_cache, v_cache,
+                            tensor_mapping["k_scale"], tensor_mapping["v_scale"],
+                            k_head_start, self.kv_head_num,
+                            bs, q_len, cache_len
+                        )
+                    elif self.store_mode == "k":
+                        _sycl_ext.store_kv_cache_fp8_single(
+                            packed_qkv, k_cache, tensor_mapping["k_scale"],
+                            k_head_start, self.kv_head_num,
+                            bs, q_len, cache_len
+                        )
+                    else:
+                        _sycl_ext.store_kv_cache_fp8_single(
+                            packed_qkv, v_cache, tensor_mapping["v_scale"],
+                            k_head_start + self.kv_head_num, self.kv_head_num,
+                            bs, q_len, cache_len
+                        )
+                else:
+                    if self.store_mode == "both":
+                        _sycl_ext.store_kv_cache_int8(
+                            packed_qkv, k_cache, v_cache,
+                            tensor_mapping["k_scale"], tensor_mapping["v_scale"],
+                            k_head_start, self.kv_head_num,
+                            bs, q_len, cache_len
+                        )
+                    elif self.store_mode == "k":
+                        _sycl_ext.store_kv_cache_int8_single(
+                            packed_qkv, k_cache, tensor_mapping["k_scale"],
+                            k_head_start, self.kv_head_num,
+                            bs, q_len, cache_len
+                        )
+                    else:
+                        _sycl_ext.store_kv_cache_int8_single(
+                            packed_qkv, v_cache, tensor_mapping["v_scale"],
+                            k_head_start + self.kv_head_num, self.kv_head_num,
+                            bs, q_len, cache_len
+                        )
+            else:
+                if self.store_mode == "both":
+                    _sycl_ext.store_kv_cache_bf16(
                         packed_qkv, k_cache, v_cache,
-                        k_scale, v_scale,
+                        k_head_start, self.kv_head_num,
+                        bs, q_len, cache_len
+                    )
+                elif self.store_mode == "k":
+                    _sycl_ext.store_kv_cache_bf16_single(
+                        packed_qkv, k_cache,
                         k_head_start, self.kv_head_num,
                         bs, q_len, cache_len
                     )
                 else:
-                    _sycl_ext.store_kv_cache_int8(
-                        packed_qkv, k_cache, v_cache,
-                        k_scale, v_scale,
-                        k_head_start, self.kv_head_num,
+                    _sycl_ext.store_kv_cache_bf16_single(
+                        packed_qkv, v_cache,
+                        k_head_start + self.kv_head_num, self.kv_head_num,
                         bs, q_len, cache_len
                     )
-            else:
-                _sycl_ext.store_kv_cache_bf16(
-                    packed_qkv, k_cache, v_cache,
-                    k_head_start, self.kv_head_num,
-                    bs, q_len, cache_len
-                )
 
             return k_cache, v_cache
 

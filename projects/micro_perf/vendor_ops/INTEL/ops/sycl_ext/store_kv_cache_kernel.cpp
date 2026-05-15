@@ -1,4 +1,11 @@
-// store_kv_cache_kernel.cpp — v5: per-token work-group + packed_qkv direct read
+// store_kv_cache_kernel.cpp — v6: streaming stores for INT8 quantized writes
+//
+// v6 changes vs v5:
+//   - Streaming store hints on INT8 cache writes (L1+L2 bypass)
+//   - KV cache is write-once: streaming avoids read-for-ownership and L2 pollution
+//   - INT8 benefits most due to scale reads competing for L2 with cache writes
+//   - BF16/FP8 paths remain unchanged (no measurable benefit from streaming)
+//   - Uses sycl::ext::intel::experimental cache_control with annotated_ptr
 //
 // v5 changes vs v4:
 //   - Accept packed_qkv directly instead of pre-sliced key/value tensors
@@ -12,11 +19,13 @@
 //   4. __restrict__ + pre-computed strides
 //   5. reqd_sub_group_size attribute for compiler to use native SIMD width
 //   6. No slice/contiguous in Python — kernel reads packed_qkv with stride
+//   7. Streaming stores: cache bypass for write-once KV cache data
 
 #include <sycl/sycl.hpp>
 #include <torch/extension.h>
 #include <ATen/ATen.h>
 #include <c10/xpu/XPUStream.h>
+#include <sycl/ext/oneapi/experimental/annotated_ptr/annotated_ptr.hpp>
 
 // --- Helper: bf16 (uint16_t) -> fp32 via bit shift ---
 static inline float bf16_to_fp32(uint16_t v) {
@@ -137,6 +146,235 @@ struct alignas(4)  int8x4_t { int8_t x, y, z, w; };
 // 16 threads × 8 elements/thread = 128 = head_dim
 constexpr int SUBGROUP_SIZE = 16;
 
+struct Bf16CopyConverter {
+    static inline uint16_t convert(uint16_t v, const float*) {
+        return v;
+    }
+};
+
+struct Int8Converter {
+    static inline int8_t convert(uint16_t v, const float* scale) {
+        float f = bf16_to_fp32(v) * (*scale);
+        f = sycl::clamp(sycl::rint(f), -127.0f, 127.0f);
+        return static_cast<int8_t>(f);
+    }
+};
+
+struct Fp8Converter {
+    static inline uint8_t convert(uint16_t v, const float* scale) {
+        return fp32_to_fp8_e4m3(bf16_to_fp32(v) * (*scale));
+    }
+};
+
+// --- Streaming store: bypass L1+L2 caches for write-once cache data ---
+template<typename T>
+inline void streaming_store(T* ptr, const T& val) {
+    namespace cc = sycl::ext::intel::experimental;
+    namespace ep = sycl::ext::oneapi::experimental;
+    ep::annotated_ptr<T, decltype(ep::properties{
+        cc::write_hint<cc::cache_control<cc::cache_mode::streaming,
+                                          cc::cache_level::L1, cc::cache_level::L2>>
+    })> ap(ptr);
+    *ap = val;
+}
+
+template <typename CacheT, typename VecT, typename Converter, bool StreamingWrite = false>
+void store_kv_cache_single_linear_impl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    const float* __restrict__ scale_ptr,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start
+) {
+    const int total_heads = static_cast<int>(packed_qkv.size(1));
+    const int head_dim = static_cast<int>(packed_qkv.size(2));
+    const int kv_head = static_cast<int>(kv_head_num);
+    const int max_kv_len = static_cast<int>(cache.size(2));
+    const int num_tokens = static_cast<int>(packed_qkv.size(0));
+    const int q_len_i = static_cast<int>(q_len);
+    const int cache_start_i = static_cast<int>(cache_start);
+
+    const int src_token_stride = total_heads * head_dim;
+    const int src_offset = static_cast<int>(src_head_start) * head_dim;
+    const int cache_head_stride = max_kv_len * head_dim;
+    const int cache_batch_stride = kv_head * cache_head_stride;
+
+    const uint16_t* __restrict__ qkv_ptr = reinterpret_cast<const uint16_t*>(packed_qkv.data_ptr());
+    CacheT* __restrict__ cache_ptr = reinterpret_cast<CacheT*>(cache.data_ptr());
+
+    // P0: 1 WG per (token, head) — reduces write scatter, improves coalescing
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
+
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
+            const int lid = item.get_local_id(0);
+            const int batch_idx = token_idx / q_len_i;
+            const int local_q_pos = token_idx % q_len_i;
+            const int src_base = token_idx * src_token_stride + src_offset + head_idx * head_dim;
+            const int dst_base = batch_idx * cache_batch_stride
+                               + head_idx * cache_head_stride
+                               + (cache_start_i + local_q_pos) * head_dim;
+
+            constexpr int VEC = 8;
+            if (head_dim % VEC == 0) {
+                const int total_vec = head_dim / VEC;
+                for (int vi = lid; vi < total_vec; vi += wg_size) {
+                    const int dim_off = vi * VEC;
+                    const int src_off = src_base + dim_off;
+                    const int dst_off = dst_base + dim_off;
+
+                    bf16x8_t src8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + src_off);
+                    const float* __restrict__ scale = scale_ptr == nullptr
+                        ? nullptr
+                        : scale_ptr + head_idx * head_dim + dim_off;
+
+                    VecT out;
+                    #pragma unroll
+                    for (int j = 0; j < VEC; j++) {
+                        out.d[j] = Converter::convert(src8.d[j], scale == nullptr ? nullptr : scale + j);
+                    }
+                    if constexpr (StreamingWrite) {
+                        streaming_store(reinterpret_cast<VecT*>(cache_ptr + dst_off), out);
+                    } else {
+                        *reinterpret_cast<VecT*>(cache_ptr + dst_off) = out;
+                    }
+                }
+            } else {
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    const int src_off = src_base + i;
+                    const int dst_off = dst_base + i;
+                    const float* __restrict__ scale = scale_ptr == nullptr
+                        ? nullptr
+                        : scale_ptr + head_idx * head_dim + i;
+
+                    auto conv_val = Converter::convert(qkv_ptr[src_off], scale);
+                    if constexpr (StreamingWrite) {
+                        streaming_store(cache_ptr + dst_off, conv_val);
+                    } else {
+                        cache_ptr[dst_off] = conv_val;
+                    }
+                }
+            }
+        });
+    });
+}
+
+template <typename CacheT, typename VecT, typename Converter, bool StreamingWrite = false>
+void store_kv_cache_single_paged_impl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    const float* __restrict__ scale_ptr,
+    torch::Tensor block_table,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start,
+    bool offset_major
+) {
+    const int total_heads = static_cast<int>(packed_qkv.size(1));
+    const int head_dim = static_cast<int>(packed_qkv.size(2));
+    const int kv_head = static_cast<int>(kv_head_num);
+    const int block_size_i = static_cast<int>(offset_major ? cache.size(1) : cache.size(2));
+    const int num_tokens = static_cast<int>(packed_qkv.size(0));
+    const int q_len_i = static_cast<int>(q_len);
+    const int cache_start_i = static_cast<int>(cache_start);
+    const int num_blocks_per_seq = static_cast<int>(block_table.size(1));
+
+    const int src_token_stride = total_heads * head_dim;
+    const int src_offset = static_cast<int>(src_head_start) * head_dim;
+    const int head_size_stride = block_size_i * head_dim;
+    const int block_stride = kv_head * head_size_stride;
+
+    const uint16_t* __restrict__ qkv_ptr = reinterpret_cast<const uint16_t*>(packed_qkv.data_ptr());
+    CacheT* __restrict__ cache_ptr = reinterpret_cast<CacheT*>(cache.data_ptr());
+    const int32_t* __restrict__ bt_ptr = block_table.data_ptr<int32_t>();
+
+    // P0: 1 WG per (token, head) — reduces write scatter, improves coalescing
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
+
+    auto& queue = c10::xpu::getCurrentXPUStream().queue();
+
+    queue.submit([&](sycl::handler& cgh) {
+        cgh.parallel_for(
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
+            [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
+            const int lid = item.get_local_id(0);
+            const int batch_idx = token_idx / q_len_i;
+            const int local_q_pos = token_idx % q_len_i;
+
+            const int global_pos = cache_start_i + local_q_pos;
+            const int block_idx = global_pos / block_size_i;
+            const int block_offset = global_pos % block_size_i;
+            const int physical_blk = bt_ptr[batch_idx * num_blocks_per_seq + block_idx];
+            const int src_base = token_idx * src_token_stride + src_offset + head_idx * head_dim;
+            const int dst_base = offset_major
+                ? physical_blk * block_stride
+                    + block_offset * kv_head * head_dim
+                    + head_idx * head_dim
+                : physical_blk * block_stride
+                    + head_idx * head_size_stride
+                    + block_offset * head_dim;
+
+            constexpr int VEC = 8;
+            if (head_dim % VEC == 0) {
+                const int total_vec = head_dim / VEC;
+                for (int vi = lid; vi < total_vec; vi += wg_size) {
+                    const int dim_off = vi * VEC;
+                    const int src_off = src_base + dim_off;
+                    const int dst_off = dst_base + dim_off;
+
+                    bf16x8_t src8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + src_off);
+                    const float* __restrict__ scale = scale_ptr == nullptr
+                        ? nullptr
+                        : scale_ptr + head_idx * head_dim + dim_off;
+
+                    VecT out;
+                    #pragma unroll
+                    for (int j = 0; j < VEC; j++) {
+                        out.d[j] = Converter::convert(src8.d[j], scale == nullptr ? nullptr : scale + j);
+                    }
+                    if constexpr (StreamingWrite) {
+                        streaming_store(reinterpret_cast<VecT*>(cache_ptr + dst_off), out);
+                    } else {
+                        *reinterpret_cast<VecT*>(cache_ptr + dst_off) = out;
+                    }
+                }
+            } else {
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    const int src_off = src_base + i;
+                    const int dst_off = dst_base + i;
+                    const float* __restrict__ scale = scale_ptr == nullptr
+                        ? nullptr
+                        : scale_ptr + head_idx * head_dim + i;
+
+                    auto conv_val = Converter::convert(qkv_ptr[src_off], scale);
+                    if constexpr (StreamingWrite) {
+                        streaming_store(cache_ptr + dst_off, conv_val);
+                    } else {
+                        cache_ptr[dst_off] = conv_val;
+                    }
+                }
+            }
+        });
+    });
+}
+
 // ============================================================
 // INT8 store: bf16 -> fp32 -> scale -> clamp -> round -> int8
 // ============================================================
@@ -161,7 +399,6 @@ void store_kv_cache_int8_sycl(
     const int q_len_i = static_cast<int>(q_len);
     const int cache_start_i = static_cast<int>(cache_start);
 
-    const int n = kv_head * head_dim;  // KV elements per token
     const int src_token_stride = total_heads * head_dim;
     const int k_offset = static_cast<int>(k_head_start) * head_dim;
     const int v_offset = (static_cast<int>(k_head_start) + kv_head) * head_dim;
@@ -174,42 +411,40 @@ void store_kv_cache_int8_sycl(
     const float* __restrict__ k_scale_ptr = k_scale.data_ptr<float>();
     const float* __restrict__ v_scale_ptr = v_scale.data_ptr<float>();
 
-    const int num_groups = num_tokens;
-    const int block_size = kv_head * SUBGROUP_SIZE;
+    // P0: 1 WG per (token, head)
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
 
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::nd_range<1>(num_groups * block_size, block_size),
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-            const int token_idx = item.get_group(0);
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
             const int lid = item.get_local_id(0);
             const int batch_idx = token_idx / q_len_i;
             const int local_q_pos = token_idx % q_len_i;
 
-            const int src_base = token_idx * src_token_stride;
+            const int k_src_base = token_idx * src_token_stride + k_offset + head_idx * head_dim;
+            const int v_src_base = token_idx * src_token_stride + v_offset + head_idx * head_dim;
+            const int dst_base = batch_idx * cache_batch_stride
+                               + head_idx * cache_head_stride
+                               + (cache_start_i + local_q_pos) * head_dim;
 
             constexpr int VEC = 8;
             if (head_dim % VEC == 0) {
-                const int total_vec = n / VEC;
-                for (int vi = lid; vi < total_vec; vi += block_size) {
-                    const int flat_elem = vi * VEC;
-                    const int head_idx = flat_elem / head_dim;
-                    const int dim_in_head = flat_elem % head_dim;
+                const int total_vec = head_dim / VEC;
+                for (int vi = lid; vi < total_vec; vi += wg_size) {
+                    const int dim_off = vi * VEC;
 
-                    const int k_src_off = src_base + k_offset + flat_elem;
-                    const int v_src_off = src_base + v_offset + flat_elem;
-                    const int dst_off = batch_idx * cache_batch_stride
-                                      + head_idx * cache_head_stride
-                                      + (cache_start_i + local_q_pos) * head_dim
-                                      + dim_in_head;
+                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_base + dim_off);
+                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_base + dim_off);
 
-                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_off);
-                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_off);
-
-                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_in_head;
-                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_in_head;
+                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_off;
+                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_off;
 
                     int8x8_t kout, vout;
                     #pragma unroll
@@ -222,31 +457,21 @@ void store_kv_cache_int8_sycl(
                         vf = sycl::clamp(sycl::rint(vf), -127.0f, 127.0f);
                         vout.d[j] = static_cast<int8_t>(vf);
                     }
-                    *reinterpret_cast<int8x8_t*>(k_cache_ptr + dst_off) = kout;
-                    *reinterpret_cast<int8x8_t*>(v_cache_ptr + dst_off) = vout;
+                    *reinterpret_cast<int8x8_t*>(k_cache_ptr + dst_base + dim_off) = kout;
+                    *reinterpret_cast<int8x8_t*>(v_cache_ptr + dst_base + dim_off) = vout;
                 }
             } else {
-                for (int i = lid; i < n; i += block_size) {
-                    const int head_idx = i / head_dim;
-                    const int dim_in_head = i % head_dim;
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    const float ks = k_scale_ptr[head_idx * head_dim + i];
+                    const float vs = v_scale_ptr[head_idx * head_dim + i];
 
-                    const int k_src_off = src_base + k_offset + i;
-                    const int v_src_off = src_base + v_offset + i;
-                    const int dst_off = batch_idx * cache_batch_stride
-                                      + head_idx * cache_head_stride
-                                      + (cache_start_i + local_q_pos) * head_dim
-                                      + dim_in_head;
-
-                    const float ks = k_scale_ptr[head_idx * head_dim + dim_in_head];
-                    const float vs = v_scale_ptr[head_idx * head_dim + dim_in_head];
-
-                    float kf = bf16_to_fp32(qkv_ptr[k_src_off]) * ks;
+                    float kf = bf16_to_fp32(qkv_ptr[k_src_base + i]) * ks;
                     kf = sycl::clamp(sycl::rint(kf), -127.0f, 127.0f);
-                    k_cache_ptr[dst_off] = static_cast<int8_t>(kf);
+                    k_cache_ptr[dst_base + i] = static_cast<int8_t>(kf);
 
-                    float vf = bf16_to_fp32(qkv_ptr[v_src_off]) * vs;
+                    float vf = bf16_to_fp32(qkv_ptr[v_src_base + i]) * vs;
                     vf = sycl::clamp(sycl::rint(vf), -127.0f, 127.0f);
-                    v_cache_ptr[dst_off] = static_cast<int8_t>(vf);
+                    v_cache_ptr[dst_base + i] = static_cast<int8_t>(vf);
                 }
             }
         });
@@ -275,7 +500,6 @@ void store_kv_cache_bf16_sycl(
     const int q_len_i = static_cast<int>(q_len);
     const int cache_start_i = static_cast<int>(cache_start);
 
-    const int n = kv_head * head_dim;  // KV elements per token
     const int src_token_stride = total_heads * head_dim;
     const int k_offset = static_cast<int>(k_head_start) * head_dim;
     const int v_offset = (static_cast<int>(k_head_start) + kv_head) * head_dim;
@@ -286,56 +510,44 @@ void store_kv_cache_bf16_sycl(
     uint16_t* __restrict__ k_cache_ptr = reinterpret_cast<uint16_t*>(k_cache.data_ptr());
     uint16_t* __restrict__ v_cache_ptr = reinterpret_cast<uint16_t*>(v_cache.data_ptr());
 
-    const int num_groups = num_tokens;
-    const int block_size = kv_head * SUBGROUP_SIZE;
+    // P0: 1 WG per (token, head)
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
 
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::nd_range<1>(num_groups * block_size, block_size),
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-            const int token_idx = item.get_group(0);
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
             const int lid = item.get_local_id(0);
             const int batch_idx = token_idx / q_len_i;
             const int local_q_pos = token_idx % q_len_i;
 
-            const int src_base = token_idx * src_token_stride;
+            const int k_src_base = token_idx * src_token_stride + k_offset + head_idx * head_dim;
+            const int v_src_base = token_idx * src_token_stride + v_offset + head_idx * head_dim;
+            const int dst_base = batch_idx * cache_batch_stride
+                               + head_idx * cache_head_stride
+                               + (cache_start_i + local_q_pos) * head_dim;
 
             constexpr int VEC = 8;
             if (head_dim % VEC == 0) {
-                const int total_vec = n / VEC;
-                for (int vi = lid; vi < total_vec; vi += block_size) {
-                    const int flat_elem = vi * VEC;
-                    const int head_idx = flat_elem / head_dim;
-                    const int dim_in_head = flat_elem % head_dim;
+                const int total_vec = head_dim / VEC;
+                for (int vi = lid; vi < total_vec; vi += wg_size) {
+                    const int dim_off = vi * VEC;
 
-                    const int k_src_off = src_base + k_offset + flat_elem;
-                    const int v_src_off = src_base + v_offset + flat_elem;
-                    const int dst_off = batch_idx * cache_batch_stride
-                                      + head_idx * cache_head_stride
-                                      + (cache_start_i + local_q_pos) * head_dim
-                                      + dim_in_head;
-
-                    *reinterpret_cast<bf16x8_t*>(k_cache_ptr + dst_off) =
-                        *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_off);
-                    *reinterpret_cast<bf16x8_t*>(v_cache_ptr + dst_off) =
-                        *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_off);
+                    bf16x8_t k_data = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_base + dim_off);
+                    bf16x8_t v_data = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_base + dim_off);
+                    *reinterpret_cast<bf16x8_t*>(k_cache_ptr + dst_base + dim_off) = k_data;
+                    *reinterpret_cast<bf16x8_t*>(v_cache_ptr + dst_base + dim_off) = v_data;
                 }
             } else {
-                for (int i = lid; i < n; i += block_size) {
-                    const int head_idx = i / head_dim;
-                    const int dim_in_head = i % head_dim;
-
-                    const int k_src_off = src_base + k_offset + i;
-                    const int v_src_off = src_base + v_offset + i;
-                    const int dst_off = batch_idx * cache_batch_stride
-                                      + head_idx * cache_head_stride
-                                      + (cache_start_i + local_q_pos) * head_dim
-                                      + dim_in_head;
-
-                    k_cache_ptr[dst_off] = qkv_ptr[k_src_off];
-                    v_cache_ptr[dst_off] = qkv_ptr[v_src_off];
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    k_cache_ptr[dst_base + i] = qkv_ptr[k_src_base + i];
+                    v_cache_ptr[dst_base + i] = qkv_ptr[v_src_base + i];
                 }
             }
         });
@@ -379,42 +591,40 @@ void store_kv_cache_fp8_sycl(
     const float* __restrict__ k_scale_ptr = k_scale.data_ptr<float>();
     const float* __restrict__ v_scale_ptr = v_scale.data_ptr<float>();
 
-    const int num_groups = num_tokens;
-    const int block_size = kv_head * SUBGROUP_SIZE;
+    // P0: 1 WG per (token, head)
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
 
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
 
     queue.submit([&](sycl::handler& cgh) {
         cgh.parallel_for(
-            sycl::nd_range<1>(num_groups * block_size, block_size),
+            sycl::nd_range<1>(num_groups * wg_size, wg_size),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-            const int token_idx = item.get_group(0);
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
             const int lid = item.get_local_id(0);
             const int batch_idx = token_idx / q_len_i;
             const int local_q_pos = token_idx % q_len_i;
 
-            const int src_base = token_idx * src_token_stride;
+            const int k_src_base = token_idx * src_token_stride + k_offset + head_idx * head_dim;
+            const int v_src_base = token_idx * src_token_stride + v_offset + head_idx * head_dim;
+            const int dst_base = batch_idx * cache_batch_stride
+                               + head_idx * cache_head_stride
+                               + (cache_start_i + local_q_pos) * head_dim;
 
             constexpr int VEC = 8;
             if (head_dim % VEC == 0) {
-                const int total_vec = n / VEC;
-                for (int vi = lid; vi < total_vec; vi += block_size) {
-                    const int flat_elem = vi * VEC;
-                    const int head_idx = flat_elem / head_dim;
-                    const int dim_in_head = flat_elem % head_dim;
+                const int total_vec = head_dim / VEC;
+                for (int vi = lid; vi < total_vec; vi += wg_size) {
+                    const int dim_off = vi * VEC;
 
-                    const int k_src_off = src_base + k_offset + flat_elem;
-                    const int v_src_off = src_base + v_offset + flat_elem;
-                    const int dst_off = batch_idx * cache_batch_stride
-                                      + head_idx * cache_head_stride
-                                      + (cache_start_i + local_q_pos) * head_dim
-                                      + dim_in_head;
+                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_base + dim_off);
+                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_base + dim_off);
 
-                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_off);
-                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_off);
-
-                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_in_head;
-                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_in_head;
+                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_off;
+                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_off;
 
                     uint8x8_t kout, vout;
                     #pragma unroll
@@ -425,29 +635,19 @@ void store_kv_cache_fp8_sycl(
                         float vf = bf16_to_fp32(vv8.d[j]) * vs[j];
                         vout.d[j] = fp32_to_fp8_e4m3(vf);
                     }
-                    *reinterpret_cast<uint8x8_t*>(k_cache_ptr + dst_off) = kout;
-                    *reinterpret_cast<uint8x8_t*>(v_cache_ptr + dst_off) = vout;
+                    *reinterpret_cast<uint8x8_t*>(k_cache_ptr + dst_base + dim_off) = kout;
+                    *reinterpret_cast<uint8x8_t*>(v_cache_ptr + dst_base + dim_off) = vout;
                 }
             } else {
-                for (int i = lid; i < n; i += block_size) {
-                    const int head_idx = i / head_dim;
-                    const int dim_in_head = i % head_dim;
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    const float ks = k_scale_ptr[head_idx * head_dim + i];
+                    const float vs = v_scale_ptr[head_idx * head_dim + i];
 
-                    const int k_src_off = src_base + k_offset + i;
-                    const int v_src_off = src_base + v_offset + i;
-                    const int dst_off = batch_idx * cache_batch_stride
-                                      + head_idx * cache_head_stride
-                                      + (cache_start_i + local_q_pos) * head_dim
-                                      + dim_in_head;
+                    float kf = bf16_to_fp32(qkv_ptr[k_src_base + i]) * ks;
+                    k_cache_ptr[dst_base + i] = fp32_to_fp8_e4m3(kf);
 
-                    const float ks = k_scale_ptr[head_idx * head_dim + dim_in_head];
-                    const float vs = v_scale_ptr[head_idx * head_dim + dim_in_head];
-
-                    float kf = bf16_to_fp32(qkv_ptr[k_src_off]) * ks;
-                    k_cache_ptr[dst_off] = fp32_to_fp8_e4m3(kf);
-
-                    float vf = bf16_to_fp32(qkv_ptr[v_src_off]) * vs;
-                    v_cache_ptr[dst_off] = fp32_to_fp8_e4m3(vf);
+                    float vf = bf16_to_fp32(qkv_ptr[v_src_base + i]) * vs;
+                    v_cache_ptr[dst_base + i] = fp32_to_fp8_e4m3(vf);
                 }
             }
         });
@@ -469,12 +669,13 @@ void store_kv_cache_int8_paged_sycl(
     int64_t kv_head_num,
     int64_t batch_size,
     int64_t q_len,
-    int64_t cache_start
+    int64_t cache_start,
+    bool offset_major
 ) {
     const int total_heads = static_cast<int>(packed_qkv.size(1));
     const int head_dim = static_cast<int>(packed_qkv.size(2));
     const int kv_head = static_cast<int>(kv_head_num);
-    const int block_size_i = static_cast<int>(k_cache.size(2));
+    const int block_size_i = static_cast<int>(offset_major ? k_cache.size(1) : k_cache.size(2));
     const int num_tokens = static_cast<int>(packed_qkv.size(0));
     const int q_len_i = static_cast<int>(q_len);
     const int cache_start_i = static_cast<int>(cache_start);
@@ -494,8 +695,9 @@ void store_kv_cache_int8_paged_sycl(
     const float* __restrict__ v_scale_ptr = v_scale.data_ptr<float>();
     const int32_t* __restrict__ bt_ptr = block_table.data_ptr<int32_t>();
 
-    const int num_groups = num_tokens;
-    const int wg_size = kv_head * SUBGROUP_SIZE;
+    // P0: 1 WG per (token, head)
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
 
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
 
@@ -503,7 +705,9 @@ void store_kv_cache_int8_paged_sycl(
         cgh.parallel_for(
             sycl::nd_range<1>(num_groups * wg_size, wg_size),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-            const int token_idx = item.get_group(0);
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
             const int lid = item.get_local_id(0);
             const int batch_idx = token_idx / q_len_i;
             const int local_q_pos = token_idx % q_len_i;
@@ -513,28 +717,27 @@ void store_kv_cache_int8_paged_sycl(
             const int block_offset = global_pos % block_size_i;
             const int physical_blk = bt_ptr[batch_idx * num_blocks_per_seq + block_idx];
 
-            const int src_base = token_idx * src_token_stride;
+            const int k_src_base = token_idx * src_token_stride + k_offset + head_idx * head_dim;
+            const int v_src_base = token_idx * src_token_stride + v_offset + head_idx * head_dim;
+            const int dst_base = offset_major
+                ? physical_blk * block_stride
+                    + block_offset * kv_head * head_dim
+                    + head_idx * head_dim
+                : physical_blk * block_stride
+                    + head_idx * head_size_stride
+                    + block_offset * head_dim;
 
             constexpr int VEC = 8;
             if (head_dim % VEC == 0) {
-                const int total_vec = n / VEC;
+                const int total_vec = head_dim / VEC;
                 for (int vi = lid; vi < total_vec; vi += wg_size) {
-                    const int flat_elem = vi * VEC;
-                    const int head_idx = flat_elem / head_dim;
-                    const int dim_in_head = flat_elem % head_dim;
+                    const int dim_off = vi * VEC;
 
-                    const int k_src_off = src_base + k_offset + flat_elem;
-                    const int v_src_off = src_base + v_offset + flat_elem;
-                    const int dst_off = physical_blk * block_stride
-                                      + head_idx * head_size_stride
-                                      + block_offset * head_dim
-                                      + dim_in_head;
+                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_base + dim_off);
+                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_base + dim_off);
 
-                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_off);
-                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_off);
-
-                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_in_head;
-                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_in_head;
+                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_off;
+                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_off;
 
                     int8x8_t kout, vout;
                     #pragma unroll
@@ -547,31 +750,21 @@ void store_kv_cache_int8_paged_sycl(
                         vf = sycl::clamp(sycl::rint(vf), -127.0f, 127.0f);
                         vout.d[j] = static_cast<int8_t>(vf);
                     }
-                    *reinterpret_cast<int8x8_t*>(k_cache_ptr + dst_off) = kout;
-                    *reinterpret_cast<int8x8_t*>(v_cache_ptr + dst_off) = vout;
+                    *reinterpret_cast<int8x8_t*>(k_cache_ptr + dst_base + dim_off) = kout;
+                    *reinterpret_cast<int8x8_t*>(v_cache_ptr + dst_base + dim_off) = vout;
                 }
             } else {
-                for (int i = lid; i < n; i += wg_size) {
-                    const int head_idx = i / head_dim;
-                    const int dim_in_head = i % head_dim;
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    const float ks = k_scale_ptr[head_idx * head_dim + i];
+                    const float vs = v_scale_ptr[head_idx * head_dim + i];
 
-                    const int k_src_off = src_base + k_offset + i;
-                    const int v_src_off = src_base + v_offset + i;
-                    const int dst_off = physical_blk * block_stride
-                                      + head_idx * head_size_stride
-                                      + block_offset * head_dim
-                                      + dim_in_head;
-
-                    const float ks = k_scale_ptr[head_idx * head_dim + dim_in_head];
-                    const float vs = v_scale_ptr[head_idx * head_dim + dim_in_head];
-
-                    float kf = bf16_to_fp32(qkv_ptr[k_src_off]) * ks;
+                    float kf = bf16_to_fp32(qkv_ptr[k_src_base + i]) * ks;
                     kf = sycl::clamp(sycl::rint(kf), -127.0f, 127.0f);
-                    k_cache_ptr[dst_off] = static_cast<int8_t>(kf);
+                    k_cache_ptr[dst_base + i] = static_cast<int8_t>(kf);
 
-                    float vf = bf16_to_fp32(qkv_ptr[v_src_off]) * vs;
+                    float vf = bf16_to_fp32(qkv_ptr[v_src_base + i]) * vs;
                     vf = sycl::clamp(sycl::rint(vf), -127.0f, 127.0f);
-                    v_cache_ptr[dst_off] = static_cast<int8_t>(vf);
+                    v_cache_ptr[dst_base + i] = static_cast<int8_t>(vf);
                 }
             }
         });
@@ -591,12 +784,13 @@ void store_kv_cache_bf16_paged_sycl(
     int64_t kv_head_num,
     int64_t batch_size,
     int64_t q_len,
-    int64_t cache_start
+    int64_t cache_start,
+    bool offset_major
 ) {
     const int total_heads = static_cast<int>(packed_qkv.size(1));
     const int head_dim = static_cast<int>(packed_qkv.size(2));
     const int kv_head = static_cast<int>(kv_head_num);
-    const int block_size_i = static_cast<int>(k_cache.size(2));
+    const int block_size_i = static_cast<int>(offset_major ? k_cache.size(1) : k_cache.size(2));
     const int num_tokens = static_cast<int>(packed_qkv.size(0));
     const int q_len_i = static_cast<int>(q_len);
     const int cache_start_i = static_cast<int>(cache_start);
@@ -614,8 +808,9 @@ void store_kv_cache_bf16_paged_sycl(
     uint16_t* __restrict__ v_cache_ptr = reinterpret_cast<uint16_t*>(v_cache.data_ptr());
     const int32_t* __restrict__ bt_ptr = block_table.data_ptr<int32_t>();
 
-    const int num_groups = num_tokens;
-    const int wg_size = kv_head * SUBGROUP_SIZE;
+    // P0: 1 WG per (token, head)
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
 
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
 
@@ -623,7 +818,9 @@ void store_kv_cache_bf16_paged_sycl(
         cgh.parallel_for(
             sycl::nd_range<1>(num_groups * wg_size, wg_size),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-            const int token_idx = item.get_group(0);
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
             const int lid = item.get_local_id(0);
             const int batch_idx = token_idx / q_len_i;
             const int local_q_pos = token_idx % q_len_i;
@@ -633,42 +830,31 @@ void store_kv_cache_bf16_paged_sycl(
             const int block_offset = global_pos % block_size_i;
             const int physical_blk = bt_ptr[batch_idx * num_blocks_per_seq + block_idx];
 
-            const int src_base = token_idx * src_token_stride;
+            const int k_src_base = token_idx * src_token_stride + k_offset + head_idx * head_dim;
+            const int v_src_base = token_idx * src_token_stride + v_offset + head_idx * head_dim;
+            const int dst_base = offset_major
+                ? physical_blk * block_stride
+                    + block_offset * kv_head * head_dim
+                    + head_idx * head_dim
+                : physical_blk * block_stride
+                    + head_idx * head_size_stride
+                    + block_offset * head_dim;
 
             constexpr int VEC = 8;
             if (head_dim % VEC == 0) {
-                const int total_vec = n / VEC;
+                const int total_vec = head_dim / VEC;
                 for (int vi = lid; vi < total_vec; vi += wg_size) {
-                    const int flat_elem = vi * VEC;
-                    const int head_idx = flat_elem / head_dim;
-                    const int dim_in_head = flat_elem % head_dim;
+                    const int dim_off = vi * VEC;
 
-                    const int k_src_off = src_base + k_offset + flat_elem;
-                    const int v_src_off = src_base + v_offset + flat_elem;
-                    const int dst_off = physical_blk * block_stride
-                                      + head_idx * head_size_stride
-                                      + block_offset * head_dim
-                                      + dim_in_head;
-
-                    *reinterpret_cast<bf16x8_t*>(k_cache_ptr + dst_off) =
-                        *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_off);
-                    *reinterpret_cast<bf16x8_t*>(v_cache_ptr + dst_off) =
-                        *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_off);
+                    bf16x8_t k_data = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_base + dim_off);
+                    bf16x8_t v_data = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_base + dim_off);
+                    *reinterpret_cast<bf16x8_t*>(k_cache_ptr + dst_base + dim_off) = k_data;
+                    *reinterpret_cast<bf16x8_t*>(v_cache_ptr + dst_base + dim_off) = v_data;
                 }
             } else {
-                for (int i = lid; i < n; i += wg_size) {
-                    const int head_idx = i / head_dim;
-                    const int dim_in_head = i % head_dim;
-
-                    const int k_src_off = src_base + k_offset + i;
-                    const int v_src_off = src_base + v_offset + i;
-                    const int dst_off = physical_blk * block_stride
-                                      + head_idx * head_size_stride
-                                      + block_offset * head_dim
-                                      + dim_in_head;
-
-                    k_cache_ptr[dst_off] = qkv_ptr[k_src_off];
-                    v_cache_ptr[dst_off] = qkv_ptr[v_src_off];
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    k_cache_ptr[dst_base + i] = qkv_ptr[k_src_base + i];
+                    v_cache_ptr[dst_base + i] = qkv_ptr[v_src_base + i];
                 }
             }
         });
@@ -690,12 +876,13 @@ void store_kv_cache_fp8_paged_sycl(
     int64_t kv_head_num,
     int64_t batch_size,
     int64_t q_len,
-    int64_t cache_start
+    int64_t cache_start,
+    bool offset_major
 ) {
     const int total_heads = static_cast<int>(packed_qkv.size(1));
     const int head_dim = static_cast<int>(packed_qkv.size(2));
     const int kv_head = static_cast<int>(kv_head_num);
-    const int block_size_i = static_cast<int>(k_cache.size(2));
+    const int block_size_i = static_cast<int>(offset_major ? k_cache.size(1) : k_cache.size(2));
     const int num_tokens = static_cast<int>(packed_qkv.size(0));
     const int q_len_i = static_cast<int>(q_len);
     const int cache_start_i = static_cast<int>(cache_start);
@@ -715,8 +902,9 @@ void store_kv_cache_fp8_paged_sycl(
     const float* __restrict__ v_scale_ptr = v_scale.data_ptr<float>();
     const int32_t* __restrict__ bt_ptr = block_table.data_ptr<int32_t>();
 
-    const int num_groups = num_tokens;
-    const int wg_size = kv_head * SUBGROUP_SIZE;
+    // P0: 1 WG per (token, head)
+    const int num_groups = num_tokens * kv_head;
+    const int wg_size = SUBGROUP_SIZE;
 
     auto& queue = c10::xpu::getCurrentXPUStream().queue();
 
@@ -724,7 +912,9 @@ void store_kv_cache_fp8_paged_sycl(
         cgh.parallel_for(
             sycl::nd_range<1>(num_groups * wg_size, wg_size),
             [=](sycl::nd_item<1> item) [[sycl::reqd_sub_group_size(SUBGROUP_SIZE)]] {
-            const int token_idx = item.get_group(0);
+            const int group_id = item.get_group(0);
+            const int token_idx = group_id / kv_head;
+            const int head_idx = group_id % kv_head;
             const int lid = item.get_local_id(0);
             const int batch_idx = token_idx / q_len_i;
             const int local_q_pos = token_idx % q_len_i;
@@ -734,28 +924,27 @@ void store_kv_cache_fp8_paged_sycl(
             const int block_offset = global_pos % block_size_i;
             const int physical_blk = bt_ptr[batch_idx * num_blocks_per_seq + block_idx];
 
-            const int src_base = token_idx * src_token_stride;
+            const int k_src_base = token_idx * src_token_stride + k_offset + head_idx * head_dim;
+            const int v_src_base = token_idx * src_token_stride + v_offset + head_idx * head_dim;
+            const int dst_base = offset_major
+                ? physical_blk * block_stride
+                    + block_offset * kv_head * head_dim
+                    + head_idx * head_dim
+                : physical_blk * block_stride
+                    + head_idx * head_size_stride
+                    + block_offset * head_dim;
 
             constexpr int VEC = 8;
             if (head_dim % VEC == 0) {
-                const int total_vec = n / VEC;
+                const int total_vec = head_dim / VEC;
                 for (int vi = lid; vi < total_vec; vi += wg_size) {
-                    const int flat_elem = vi * VEC;
-                    const int head_idx = flat_elem / head_dim;
-                    const int dim_in_head = flat_elem % head_dim;
+                    const int dim_off = vi * VEC;
 
-                    const int k_src_off = src_base + k_offset + flat_elem;
-                    const int v_src_off = src_base + v_offset + flat_elem;
-                    const int dst_off = physical_blk * block_stride
-                                      + head_idx * head_size_stride
-                                      + block_offset * head_dim
-                                      + dim_in_head;
+                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_base + dim_off);
+                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_base + dim_off);
 
-                    bf16x8_t kv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + k_src_off);
-                    bf16x8_t vv8 = *reinterpret_cast<const bf16x8_t*>(qkv_ptr + v_src_off);
-
-                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_in_head;
-                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_in_head;
+                    const float* __restrict__ ks = k_scale_ptr + head_idx * head_dim + dim_off;
+                    const float* __restrict__ vs = v_scale_ptr + head_idx * head_dim + dim_off;
 
                     uint8x8_t kout, vout;
                     #pragma unroll
@@ -766,33 +955,117 @@ void store_kv_cache_fp8_paged_sycl(
                         float vf = bf16_to_fp32(vv8.d[j]) * vs[j];
                         vout.d[j] = fp32_to_fp8_e4m3(vf);
                     }
-                    *reinterpret_cast<uint8x8_t*>(k_cache_ptr + dst_off) = kout;
-                    *reinterpret_cast<uint8x8_t*>(v_cache_ptr + dst_off) = vout;
+                    *reinterpret_cast<uint8x8_t*>(k_cache_ptr + dst_base + dim_off) = kout;
+                    *reinterpret_cast<uint8x8_t*>(v_cache_ptr + dst_base + dim_off) = vout;
                 }
             } else {
-                for (int i = lid; i < n; i += wg_size) {
-                    const int head_idx = i / head_dim;
-                    const int dim_in_head = i % head_dim;
+                for (int i = lid; i < head_dim; i += wg_size) {
+                    const float ks = k_scale_ptr[head_idx * head_dim + i];
+                    const float vs = v_scale_ptr[head_idx * head_dim + i];
 
-                    const int k_src_off = src_base + k_offset + i;
-                    const int v_src_off = src_base + v_offset + i;
-                    const int dst_off = physical_blk * block_stride
-                                      + head_idx * head_size_stride
-                                      + block_offset * head_dim
-                                      + dim_in_head;
+                    float kf = bf16_to_fp32(qkv_ptr[k_src_base + i]) * ks;
+                    k_cache_ptr[dst_base + i] = fp32_to_fp8_e4m3(kf);
 
-                    const float ks = k_scale_ptr[head_idx * head_dim + dim_in_head];
-                    const float vs = v_scale_ptr[head_idx * head_dim + dim_in_head];
-
-                    float kf = bf16_to_fp32(qkv_ptr[k_src_off]) * ks;
-                    k_cache_ptr[dst_off] = fp32_to_fp8_e4m3(kf);
-
-                    float vf = bf16_to_fp32(qkv_ptr[v_src_off]) * vs;
-                    v_cache_ptr[dst_off] = fp32_to_fp8_e4m3(vf);
+                    float vf = bf16_to_fp32(qkv_ptr[v_src_base + i]) * vs;
+                    v_cache_ptr[dst_base + i] = fp32_to_fp8_e4m3(vf);
                 }
             }
         });
     });
+}
+
+void store_kv_cache_int8_single_sycl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    torch::Tensor scale,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start
+) {
+    store_kv_cache_single_linear_impl<int8_t, int8x8_t, Int8Converter, true>(
+        packed_qkv, cache, scale.data_ptr<float>(), src_head_start, kv_head_num,
+        batch_size, q_len, cache_start);
+}
+
+void store_kv_cache_bf16_single_sycl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start
+) {
+    store_kv_cache_single_linear_impl<uint16_t, bf16x8_t, Bf16CopyConverter>(
+        packed_qkv, cache, nullptr, src_head_start, kv_head_num,
+        batch_size, q_len, cache_start);
+}
+
+void store_kv_cache_fp8_single_sycl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    torch::Tensor scale,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start
+) {
+    store_kv_cache_single_linear_impl<uint8_t, uint8x8_t, Fp8Converter>(
+        packed_qkv, cache, scale.data_ptr<float>(), src_head_start, kv_head_num,
+        batch_size, q_len, cache_start);
+}
+
+void store_kv_cache_int8_single_paged_sycl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    torch::Tensor scale,
+    torch::Tensor block_table,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start,
+    bool offset_major
+) {
+    store_kv_cache_single_paged_impl<int8_t, int8x8_t, Int8Converter, true>(
+        packed_qkv, cache, scale.data_ptr<float>(), block_table, src_head_start,
+        kv_head_num, batch_size, q_len, cache_start, offset_major);
+}
+
+void store_kv_cache_bf16_single_paged_sycl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    torch::Tensor block_table,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start,
+    bool offset_major
+) {
+    store_kv_cache_single_paged_impl<uint16_t, bf16x8_t, Bf16CopyConverter>(
+        packed_qkv, cache, nullptr, block_table, src_head_start, kv_head_num,
+        batch_size, q_len, cache_start, offset_major);
+}
+
+void store_kv_cache_fp8_single_paged_sycl(
+    torch::Tensor packed_qkv,
+    torch::Tensor cache,
+    torch::Tensor scale,
+    torch::Tensor block_table,
+    int64_t src_head_start,
+    int64_t kv_head_num,
+    int64_t batch_size,
+    int64_t q_len,
+    int64_t cache_start,
+    bool offset_major
+) {
+    store_kv_cache_single_paged_impl<uint8_t, uint8x8_t, Fp8Converter>(
+        packed_qkv, cache, scale.data_ptr<float>(), block_table, src_head_start,
+        kv_head_num, batch_size, q_len, cache_start, offset_major);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -802,10 +1075,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "Fused bf16->bf16 store to linear KV cache (SYCL v5)");
     m.def("store_kv_cache_fp8", &store_kv_cache_fp8_sycl,
           "Fused bf16->fp8_e4m3 quantized store to linear KV cache (SYCL)");
+        m.def("store_kv_cache_int8_single", &store_kv_cache_int8_single_sycl,
+            "Fused bf16->int8 quantized store to one linear KV cache stream (SYCL)");
+        m.def("store_kv_cache_bf16_single", &store_kv_cache_bf16_single_sycl,
+            "Fused bf16->bf16 store to one linear KV cache stream (SYCL)");
+        m.def("store_kv_cache_fp8_single", &store_kv_cache_fp8_single_sycl,
+            "Fused bf16->fp8_e4m3 quantized store to one linear KV cache stream (SYCL)");
     m.def("store_kv_cache_int8_paged", &store_kv_cache_int8_paged_sycl,
           "Fused bf16->int8 quantized store to paged KV cache (SYCL)");
     m.def("store_kv_cache_bf16_paged", &store_kv_cache_bf16_paged_sycl,
           "Fused bf16->bf16 store to paged KV cache (SYCL)");
     m.def("store_kv_cache_fp8_paged", &store_kv_cache_fp8_paged_sycl,
           "Fused bf16->fp8_e4m3 quantized store to paged KV cache (SYCL)");
+        m.def("store_kv_cache_int8_single_paged", &store_kv_cache_int8_single_paged_sycl,
+            "Fused bf16->int8 quantized store to one paged KV cache stream (SYCL)");
+        m.def("store_kv_cache_bf16_single_paged", &store_kv_cache_bf16_single_paged_sycl,
+            "Fused bf16->bf16 store to one paged KV cache stream (SYCL)");
+        m.def("store_kv_cache_fp8_single_paged", &store_kv_cache_fp8_single_paged_sycl,
+            "Fused bf16->fp8_e4m3 quantized store to one paged KV cache stream (SYCL)");
 }
