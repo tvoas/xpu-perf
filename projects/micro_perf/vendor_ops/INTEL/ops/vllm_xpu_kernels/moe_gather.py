@@ -110,9 +110,6 @@ try:
             unpermuted_row_to_permuted_row = tensor_mapping[
                 "unpermuted_row_to_permuted_row"
             ]
-            expert_first_token_offset = tensor_mapping[
-                "expert_first_token_offset"
-            ]
 
             convergent_tokens = tensor_mapping["convergent_tokens"]
 
@@ -121,7 +118,6 @@ try:
                 scatter_tokens,
                 topk_weights,
                 unpermuted_row_to_permuted_row,
-                expert_first_token_offset,
                 self.num_experts_per_rank,
             )
             # convergent_tokens[
