@@ -1,0 +1,238 @@
+{
+    "quant_matmul": [
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "sp_size": 1,
+            "hidden_size": 3584,
+            "new_hidden_size": [384, 11264],
+            "num_tokens": [
+                2048,
+                4096,
+                7680,
+                8192,
+                10240,
+                16384
+            ]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "sp_size": 1,
+            "hidden_size": 8192,
+            "new_hidden_size": 3584,
+            "num_tokens": [
+                2048,
+                4096,
+                7680,
+                8192,
+                10240,
+                16384
+            ]
+        }
+    ],
+    "flash_attention": [
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype": "int8",
+            "cache_dtype": "int8",
+            "qk_compute_dtype": "int8",
+            "pv_compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "q_head_num": 2,
+            "kv_head_num": 1,
+            "head_dim": 128,
+            "block_size": 512,
+            "batch_size": 1,
+            "cache_len": [
+                0
+            ],
+            "q_len": [32768, 65536, 131072]
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype": "int8",
+            "cache_dtype": "int8",
+            "qk_compute_dtype": "int8",
+            "pv_compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "q_head_num": 4,
+            "kv_head_num": 1,
+            "head_dim": 128,
+            "block_size": 512,
+            "batch_size": 1,
+            "cache_len": [
+                57344
+            ],
+            "q_len": 8192
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype": "int8",
+            "cache_dtype": "int8",
+            "qk_compute_dtype": "int8",
+            "pv_compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "q_head_num": 8,
+            "kv_head_num": 2,
+            "head_dim": 128,
+            "block_size": 512,
+            "batch_size": 2,
+            "cache_len": [
+                0
+            ],
+            "q_len": 10240
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype": "int8",
+            "cache_dtype": "int8",
+            "qk_compute_dtype": "int8",
+            "pv_compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "q_head_num": 2,
+            "kv_head_num": 1,
+            "head_dim": 128,
+            "block_size": 512,
+            "batch_size": 2,
+            "cache_len": [
+                57344
+            ],
+            "q_len": 8192
+        },
+        {
+            "arg_type": "llm",
+            "attn_mode": "prefill",
+            "dtype": "int8",
+            "cache_dtype": "int8",
+            "qk_compute_dtype": "int8",
+            "pv_compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "q_head_num": 2,
+            "kv_head_num": 1,
+            "head_dim": 128,
+            "block_size": 512,
+            "batch_size": 6,
+            "cache_len": [
+                0
+            ],
+            "q_len": 10240
+        }
+    ],
+    "moe_quant_group_gemm": [
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 24,
+            "topk": 1,
+            "hidden_size": 1280,
+            "new_hidden_size": 3584,
+            "num_tokens": [16392, 32784, 61440, 65544, 131088]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 48,
+            "topk": 1,
+            "hidden_size": 1280,
+            "new_hidden_size": 3584,
+            "num_tokens": [32784, 65568, 131088]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 96,
+            "topk": 1,
+            "hidden_size": 1280,
+            "new_hidden_size": 3584,
+            "num_tokens": [16416]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 192,
+            "topk": 1,
+            "hidden_size": 1280,
+            "new_hidden_size": 3584,
+            "num_tokens": [81984]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 24,
+            "topk": 1,
+            "hidden_size": 3584,
+            "new_hidden_size": 2560,
+            "num_tokens": [16392, 32784, 61440, 65544, 131088]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 48,
+            "topk": 1,
+            "hidden_size": 3584,
+            "new_hidden_size": 2560,
+            "num_tokens": [32784, 65568, 131088]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 96,
+            "topk": 1,
+            "hidden_size": 3584,
+            "new_hidden_size": 2560,
+            "num_tokens": [16416]
+        },
+        {
+            "arg_type": "llm",
+            "dtype": "int8",
+            "w_dtype": "int8",
+            "compute_dtype": "int8",
+            "dst_dtype": "bfloat16",
+            "ep_size": 1,
+            "num_experts": 192,
+            "topk": 1,
+            "hidden_size": 3584,
+            "new_hidden_size": 2560,
+            "num_tokens": [81984]
+        }
+    ]
+}
